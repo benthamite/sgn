@@ -108,6 +108,28 @@ When nil, only the first frame of animated media will be displayed."
 (defconst sgn--process-name "signal-rpc"
   "Internal name for the signal-cli process.")
 
+(defconst sgn--max-partial-line-length 100000
+  "Maximum bytes to buffer before discarding an incomplete JSON line.
+Prevents unbounded memory growth if signal-cli emits a very long
+line without a terminating newline.")
+
+(defconst sgn--contact-refresh-delay 2
+  "Seconds to wait after process start before refreshing contacts.
+Gives signal-cli time to initialize its JSON-RPC interface.")
+
+(defconst sgn--sticker-max-width 150
+  "Max pixel width for sticker images (smaller than general media).")
+
+(defconst sgn--image-max-width 400
+  "Default max pixel width for inline images.")
+
+(defconst sgn--temp-file-cleanup-delay "5 sec"
+  "Delay before deleting temporary converted sticker files.
+Gives Emacs time to read and render the image before removal.")
+
+(defconst sgn--sticker-fallback-emoji "🧩"
+  "Emoji shown when a sticker lacks its own emoji metadata.")
+
 (defconst sgn--buffer-stderr " *sgn-stderr*"
   "Name of the hidden buffer used for process stderr.")
 
@@ -118,13 +140,22 @@ When nil, only the first frame of animated media will be displayed."
   "Mapping of RPC ID to buffer name for error reporting.")
 
 (defvar sgn--contact-map (make-hash-table :test 'equal)
-  "Cache of phone numbers to display names.")
+  "Cache of Signal IDs to display names.
+Keys are phone numbers (for contacts) or base64 group IDs
+\(for groups).  Values are human-readable names.")
 
 (defvar sgn--active-chats (make-hash-table :test 'equal)
-  "Set of currently active chat IDs.")
+  "Hash table used as a set of currently active chat IDs.
+Keys are Signal IDs; values are always t.")
 
 (defvar sgn--partial-line ""
   "Buffer string for incomplete JSON lines received from the process.")
+
+(defun sgn--ensure-list (value)
+  "Coerce VALUE to a list if it is a vector.
+`json-read' returns JSON arrays as vectors; this normalizes them
+for `dolist' iteration."
+  (if (vectorp value) (append value nil) value))
 
 (defvar sgn--pending-callbacks (make-hash-table :test 'equal)
   "Mapping of RPC ID to callback function for handling responses.")
@@ -139,7 +170,7 @@ When nil, only the first frame of animated media will be displayed."
     (insert (apply #'format fmt args))
     (insert "\n")))
 
-(defun sgn-toggle-log ()
+(defun sgn-show-log ()
   "Display the debug log buffer."
   (interactive)
   (display-buffer (get-buffer-create "*sgn-log*")))
@@ -173,7 +204,7 @@ When nil, only the first frame of animated media will be displayed."
                :coding 'utf-8-unix)))
     (set-process-query-on-exit-flag proc nil)
     (sgn--log "Sgn service started.")
-    (run-at-time 2 nil #'sgn-refresh-contacts)
+    (run-at-time sgn--contact-refresh-delay nil #'sgn-refresh-contacts)
     (message "Sgn service started.")))
 
 (defun sgn-stop ()
@@ -209,8 +240,7 @@ when a successful response arrives."
 (defun sgn--process-filter (_proc string)
   "Accumulate output from process and parse complete JSON objects from STRING."
   (setq sgn--partial-line (concat sgn--partial-line string))
-  ;; DoS Protection: Reset buffer if it gets suspiciously large without a newline
-  (when (> (length sgn--partial-line) 100000)
+  (when (> (length sgn--partial-line) sgn--max-partial-line-length)
     (setq sgn--partial-line "")
     (sgn--log "WARNING: Buffer overflow protection triggered. Dropped data."))
 
@@ -269,7 +299,7 @@ Invokes and removes the pending callback, if any."
 
 (defun sgn--populate-contacts (result)
   "Populate the contact map and active chats from a listContacts RESULT."
-  (let ((contacts (if (vectorp result) (append result nil) result)))
+  (let ((contacts (sgn--ensure-list result)))
     (dolist (contact contacts)
       (let ((number (alist-get 'number contact))
             (name (alist-get 'name contact)))
@@ -280,7 +310,7 @@ Invokes and removes the pending callback, if any."
 
 (defun sgn--populate-groups (result)
   "Populate active chats from a listGroups RESULT."
-  (let ((groups (if (vectorp result) (append result nil) result)))
+  (let ((groups (sgn--ensure-list result)))
     (dolist (group groups)
       (let ((group-id (alist-get 'id group))
             (name (alist-get 'name group)))
@@ -386,7 +416,8 @@ Returns the path to the temporary GIF."
   (let ((tmp-gif (make-temp-file "sgn-sticker-" nil ".gif")))
     (if (executable-find "convert")
         (with-temp-buffer
-          ;; Run: convert apng:INPUT -coalesce gif:OUTPUT
+          ;; "apng:" forces APNG decoding; "-coalesce" merges frames
+          ;; into standalone images (required for correct GIF animation)
           (if (eq 0 (call-process "convert" nil nil nil
                                   (concat "apng:" file)
                                   "-coalesce"
@@ -405,7 +436,7 @@ Returns the path to the temporary GIF."
   (when sticker
     (sgn--insert-sticker sticker))
   (when attachments
-    (let ((att-list (if (vectorp attachments) (append attachments nil) attachments)))
+    (let ((att-list (sgn--ensure-list attachments)))
       (dolist (att att-list)
         (sgn--insert-attachment att)))))
 
@@ -413,7 +444,7 @@ Returns the path to the temporary GIF."
   "Insert STICKER media into the current buffer."
   (let* ((pack-id (alist-get 'packId sticker))
          (sticker-id (alist-get 'stickerId sticker))
-         (emoji (or (alist-get 'emoji sticker) "🧩"))
+         (emoji (or (alist-get 'emoji sticker) sgn--sticker-fallback-emoji))
          (file (when (and pack-id sticker-id)
                  (sgn--find-sticker pack-id sticker-id))))
     (insert "\n")
@@ -435,9 +466,9 @@ Handles APNG-to-GIF conversion when ImageMagick is available."
         (when gif
           (setq final-file gif)
           (setq converted t))))
-    (let ((image (sgn--insert-inline-image final-file 150)))
+    (let ((image (sgn--insert-inline-image final-file sgn--sticker-max-width)))
       (when converted
-        (run-at-time "5 sec" nil
+        (run-at-time sgn--temp-file-cleanup-delay nil
                      (lambda (f) (when (file-exists-p f) (delete-file f)))
                      final-file))
       (unless image
@@ -471,10 +502,12 @@ Handles APNG-to-GIF conversion when ImageMagick is available."
                      'face 'font-lock-comment-face)))))
 
 (defun sgn--insert-inline-image (path &optional max-width)
-  "Insert an inline image from PATH with MAX-WIDTH (default 400).
-Animate multi-frame images when `sgn-enable-animation' is non-nil.
+  "Insert an inline image from PATH with optional MAX-WIDTH.
+MAX-WIDTH defaults to `sgn--image-max-width'.  Animate
+multi-frame images when `sgn-enable-animation' is non-nil.
 Return the image object, or nil if creation failed."
-  (let ((image (create-image path nil nil :max-width (or max-width 400))))
+  (let ((image (create-image path nil nil
+                             :max-width (or max-width sgn--image-max-width))))
     (when image
       (insert-image image)
       (when (and sgn-enable-animation (fboundp 'image-animate)
@@ -579,8 +612,9 @@ media data, and IS-ME is non-nil if the message is from the user."
 ;;; Interactive Commands
 
 (defun sgn--is-group-id (id)
-  "Return non-nil if ID look like a group ID (base64).
-Returns nil if ID is a phone number (+) or UUID (contains -)."
+  "Return non-nil if ID looks like a Signal group ID.
+Uses a heuristic: phone numbers start with \"+\" and UUIDs
+contain \"-\"; anything else is assumed to be a base64 group ID."
   (not (or (string-prefix-p "+" id)
            (string-match-p "-" id))))
 

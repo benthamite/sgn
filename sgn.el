@@ -401,89 +401,86 @@ Returns the path to the temporary GIF."
       nil)))
 
 (defun sgn--insert-media (attachments sticker)
-  "Insert buttons or inline images for ATTACHMENTS and STICKER.
-Handles animation support if enabled."
-  ;; 1. Handle Stickers
+  "Insert media for ATTACHMENTS and STICKER into the current buffer."
   (when sticker
-    (let* ((pack-id (alist-get 'packId sticker))
-           (sticker-id (alist-get 'stickerId sticker))
-           (emoji (or (alist-get 'emoji sticker) "🧩"))
-           (file (if (and pack-id sticker-id)
-                     (sgn--find-sticker pack-id sticker-id)
-                   nil)))
-      (insert "\n")
-      (cond
-       ((and file (file-exists-p file))
-        (let* ((type (image-type-from-file-header file))
-               (final-file file)
-               (final-type type)
-               (converted nil))
-
-          ;; CONVERSION LOGIC: If PNG (APNG), try to convert to GIF
-          (when (and (eq type 'png) (executable-find "convert"))
-            (let ((gif (sgn--convert-apng-to-gif file)))
-              (when gif
-                (setq final-file gif)
-                (setq final-type 'gif)
-                (setq converted t))))
-
-          ;; Load the image
-          (let ((image (create-image final-file final-type nil :max-width 150)))
-            ;; Clean up temp file if we created one
-            (when converted
-              (run-at-time "5 sec" nil (lambda (f) (when (file-exists-p f) (delete-file f))) final-file))
-
-            (if image
-                (progn
-                  (insert-image image)
-                  (when (and sgn-enable-animation (fboundp 'image-animate))
-                    (image-animate image nil t))) ;; Loop forever
-              ;; Render failed
-              (insert (propertize (format "[Sticker %s (Render Failed)]" emoji)
-                                  'face 'font-lock-warning-face))))))
-       ;; File not found
-       (t
-        (insert (propertize (format "[Sticker %s]" emoji)
-                            'face 'font-lock-constant-face))))))
-
-  ;; 2. Handle Attachments
+    (sgn--insert-sticker sticker))
   (when attachments
     (let ((att-list (if (vectorp attachments) (append attachments nil) attachments)))
       (dolist (att att-list)
-        (let* ((path (alist-get 'storedFilename att))
-               (type (alist-get 'contentType att))
-               (name (or (alist-get 'filename att) "attachment")))
-          (insert "\n")
-          (cond
-           ;; A: Inline Image
-           ((and path type (string-prefix-p "image/" type) (file-exists-p path))
-            (let ((image (create-image path nil nil :max-width 400)))
-              (insert-image image)
-              (when (and sgn-enable-animation (fboundp 'image-animate) (image-multi-frame-p image))
-                (image-animate image nil t))))
-           ;; B: File Button
-           ((and path (file-exists-p path))
-            (insert-button (format "[File: %s]" name)
-                           'action (lambda (_) (browse-url-of-file path))
-                           'face 'link
-                           'help-echo (format "Type: %s\nPath: %s" type path)))
-           ;; C: Missing/Not Downloaded
-           (t
-            (let* ((att-id (alist-get 'id att))
-                   (std-path (expand-file-name (format "attachments/%s" att-id) sgn-data-directory))
-                   (exists (file-exists-p std-path)))
-              (if exists
-                  (if (and type (string-prefix-p "image/" type))
-                      (let ((image (create-image std-path nil nil :max-width 400)))
-                        (insert-image image)
-                        (when (and sgn-enable-animation (fboundp 'image-animate) (image-multi-frame-p image))
-                          (image-animate image nil t)))
-                    (insert-button (format "[File: %s]" name)
-                                   'action (lambda (_) (browse-url-of-file std-path))
-                                   'face 'link))
-                (insert-button (format "[File: %s (Not Downloaded)]" name)
-                               'action (lambda (_) (message "File not found at %s" std-path))
-                               'face 'font-lock-comment-face))))))))))
+        (sgn--insert-attachment att)))))
+
+(defun sgn--insert-sticker (sticker)
+  "Insert STICKER media into the current buffer."
+  (let* ((pack-id (alist-get 'packId sticker))
+         (sticker-id (alist-get 'stickerId sticker))
+         (emoji (or (alist-get 'emoji sticker) "🧩"))
+         (file (when (and pack-id sticker-id)
+                 (sgn--find-sticker pack-id sticker-id))))
+    (insert "\n")
+    (cond
+     ((and file (file-exists-p file))
+      (sgn--insert-sticker-image file emoji))
+     (t
+      (insert (propertize (format "[Sticker %s]" emoji)
+                          'face 'font-lock-constant-face))))))
+
+(defun sgn--insert-sticker-image (file emoji)
+  "Insert sticker image from FILE, with EMOJI as fallback label.
+Handles APNG-to-GIF conversion when ImageMagick is available."
+  (let* ((type (image-type-from-file-header file))
+         (final-file file)
+         (converted nil))
+    (when (and (eq type 'png) (executable-find "convert"))
+      (let ((gif (sgn--convert-apng-to-gif file)))
+        (when gif
+          (setq final-file gif)
+          (setq converted t))))
+    (let ((image (sgn--insert-inline-image final-file 150)))
+      (when converted
+        (run-at-time "5 sec" nil
+                     (lambda (f) (when (file-exists-p f) (delete-file f)))
+                     final-file))
+      (unless image
+        (insert (propertize (format "[Sticker %s (Render Failed)]" emoji)
+                            'face 'font-lock-warning-face))))))
+
+(defun sgn--insert-attachment (att)
+  "Insert a single attachment ATT into the current buffer."
+  (let* ((stored (alist-get 'storedFilename att))
+         (type (alist-get 'contentType att))
+         (name (or (alist-get 'filename att) "attachment"))
+         (att-id (alist-get 'id att))
+         (path (or (and stored (file-exists-p stored) stored)
+                   (let ((std (expand-file-name
+                               (format "attachments/%s" att-id)
+                               sgn-data-directory)))
+                     (and (file-exists-p std) std)))))
+    (insert "\n")
+    (cond
+     ((and path type (string-prefix-p "image/" type))
+      (sgn--insert-inline-image path))
+     (path
+      (insert-button (format "[File: %s]" name)
+                     'action (lambda (_) (browse-url-of-file path))
+                     'face 'link
+                     'help-echo (format "Type: %s\nPath: %s" type path)))
+     (t
+      (insert-button (format "[File: %s (Not Downloaded)]" name)
+                     'action (lambda (_)
+                               (message "File not found: attachments/%s" att-id))
+                     'face 'font-lock-comment-face)))))
+
+(defun sgn--insert-inline-image (path &optional max-width)
+  "Insert an inline image from PATH with MAX-WIDTH (default 400).
+Animate multi-frame images when `sgn-enable-animation' is non-nil.
+Return the image object, or nil if creation failed."
+  (let ((image (create-image path nil nil :max-width (or max-width 400))))
+    (when image
+      (insert-image image)
+      (when (and sgn-enable-animation (fboundp 'image-animate)
+                 (image-multi-frame-p image))
+        (image-animate image nil t)))
+    image))
 
 ;;; Buffer & UI Management
 
@@ -597,12 +594,9 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
       (let ((inhibit-read-only t))
         (delete-region start end))
 
-      (let ((is-group (sgn--is-group-id sgn--chat-id))
-            (params `((message . ,text))))
-        (if is-group
-            (push `(groupId . ,sgn--chat-id) params)
-          (push `(recipient . [,sgn--chat-id]) params))
-        (sgn--send-rpc "send" params (current-buffer)))
+      (sgn--send-rpc "send"
+                     (sgn--build-send-params sgn--chat-id `((message . ,text)))
+                     (current-buffer))
 
       (sgn--insert-msg sgn--chat-id "Me" text nil nil t))))
 
@@ -612,16 +606,20 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
   (interactive "fAttachment: ")
   (unless sgn--chat-id
     (user-error "Not in a Signal chat buffer"))
-  (let* ((full-path (expand-file-name file-path))
-         (is-group (sgn--is-group-id sgn--chat-id))
-         (params `((attachments . [,full-path]))))
-    (if is-group
-        (push `(groupId . ,sgn--chat-id) params)
-      (push `(recipient . [,sgn--chat-id]) params))
-    (sgn--send-rpc "send" params (current-buffer))
+  (let ((full-path (expand-file-name file-path)))
+    (sgn--send-rpc "send"
+                   (sgn--build-send-params sgn--chat-id
+                                           `((attachments . [,full-path])))
+                   (current-buffer))
     (sgn--insert-msg sgn--chat-id "Me"
-                        (format "[Sending: %s]" (file-name-nondirectory full-path))
-                        nil nil t)))
+                     (format "[Sending: %s]" (file-name-nondirectory full-path))
+                     nil nil t)))
+
+(defun sgn--build-send-params (chat-id base-params)
+  "Add recipient or group addressing to BASE-PARAMS for CHAT-ID."
+  (if (sgn--is-group-id chat-id)
+      (cons `(groupId . ,chat-id) base-params)
+    (cons `(recipient . [,chat-id]) base-params)))
 
 ;;;###autoload
 (defun sgn-chat (recipient)

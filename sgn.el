@@ -243,7 +243,7 @@ when a successful response arrives."
         (result (alist-get 'result json))
         (params (alist-get 'params json)))
     (cond
-     ((string= method "receive") (sgn--handle-receive params))
+     ((equal method "receive") (sgn--handle-receive params))
      (error-obj (sgn--handle-error id error-obj))
      ((and id result) (sgn--handle-result id result)))))
 
@@ -252,6 +252,8 @@ when a successful response arrives."
   (let* ((buf-name (gethash id sgn--request-buffer-map))
          (msg (alist-get 'message error-obj)))
     (sgn--log "RPC Error [%s]: %s" id msg)
+    (remhash id sgn--request-buffer-map)
+    (remhash id sgn--pending-callbacks)
     (when (and buf-name (get-buffer buf-name))
       (with-current-buffer buf-name
         (sgn--insert-system-msg (format "ERROR: %s" msg) 'sgn-error-face)))))
@@ -260,6 +262,7 @@ when a successful response arrives."
   "Handle a successful RPC response for request ID with RESULT.
 Invokes and removes the pending callback, if any."
   (let ((callback (gethash id sgn--pending-callbacks)))
+    (remhash id sgn--request-buffer-map)
     (when callback
       (remhash id sgn--pending-callbacks)
       (funcall callback result))))
@@ -335,12 +338,15 @@ Invokes and removes the pending callback, if any."
         ;; 2. Sync (My sent messages)
         (when sync
           (let* ((sent (alist-get 'sentMessage sync))
-                 (dest (alist-get 'destinationNumber sent))
+                 (sync-group (alist-get 'groupInfo sent))
+                 (sync-id (or (and sync-group (alist-get 'groupId sync-group))
+                              (alist-get 'destinationNumber sent)))
                  (msg-text (alist-get 'message sent))
                  (attachments (alist-get 'attachments sent))
                  (sticker (alist-get 'sticker sent)))
-            (when (and dest (or msg-text attachments sticker))
-              (sgn--insert-msg dest "Me" msg-text attachments sticker t))))
+            (when (and sync-id (or msg-text attachments sticker))
+              (puthash sync-id t sgn--active-chats)
+              (sgn--insert-msg sync-id "Me" msg-text attachments sticker t))))
 
         ;; 3. Typing
         (when (and typing (string= "STARTED" (alist-get 'action typing)))
@@ -450,7 +456,7 @@ Handles animation support if enabled."
           (insert "\n")
           (cond
            ;; A: Inline Image
-           ((and path (string-prefix-p "image/" type) (file-exists-p path))
+           ((and path type (string-prefix-p "image/" type) (file-exists-p path))
             (let ((image (create-image path nil nil :max-width 400)))
               (insert-image image)
               (when (and sgn-enable-animation (fboundp 'image-animate) (image-multi-frame-p image))
@@ -467,7 +473,7 @@ Handles animation support if enabled."
                    (std-path (expand-file-name (format "attachments/%s" att-id) sgn-data-directory))
                    (exists (file-exists-p std-path)))
               (if exists
-                  (if (string-prefix-p "image/" type)
+                  (if (and type (string-prefix-p "image/" type))
                       (let ((image (create-image std-path nil nil :max-width 400)))
                         (insert-image image)
                         (when (and sgn-enable-animation (fboundp 'image-animate) (image-multi-frame-p image))
@@ -560,7 +566,7 @@ media data, and IS-ME is non-nil if the message is from the user."
         ;; Redraw Prompt at the new bottom
         (sgn--draw-prompt)))
 
-    (let ((win (get-buffer-window (sgn--get-buffer id))))
+    (let ((win (get-buffer-window (current-buffer))))
       (when win (set-window-point win (point-max))))))
 
 (defun sgn--insert-system-msg (text face)

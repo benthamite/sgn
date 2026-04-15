@@ -36,6 +36,15 @@
 (declare-function sgn-media-insert-voice-note "sgn-media")
 (declare-function sgn-media-insert-link-preview "sgn-media")
 (declare-function sgn-format-apply-styles "sgn-format")
+(declare-function sgn-react "sgn-actions")
+(declare-function sgn-reply "sgn-actions")
+(declare-function sgn-edit "sgn-actions")
+(declare-function sgn-delete "sgn-actions")
+(declare-function sgn-forward "sgn-actions")
+(declare-function sgn-toggle-pin "sgn-actions")
+(declare-function sgn-copy-text "sgn-actions")
+(declare-function sgn-attach-file "sgn")
+(declare-function sgn-send-voice-note "sgn")
 
 (defvar sgn-account)
 (defvar sgn-send-read-receipts)
@@ -546,8 +555,6 @@ Used after edits, deletes, or reaction changes."
 Handles grouping, headers, body, quotes, reactions, and media."
   (let* ((sender (plist-get msg :sender))
          (timestamp (plist-get msg :timestamp))
-         (deleted (plist-get msg :deleted))
-         (rowid (plist-get msg :rowid))
          (need-header (sgn-chat--needs-header-p sender timestamp))
          (start (point)))
     ;; Header (if not grouped)
@@ -572,8 +579,6 @@ Handles grouping, headers, body, quotes, reactions, and media."
   "Render a message group header for SENDER at TIMESTAMP."
   (let* ((name (sgn-contacts-display-sender sender))
          (time-str (sgn-chat--format-timestamp timestamp))
-         (is-me (and sgn-account (equal sender sgn-account)))
-         (name-face (if is-me 'sgn-my-msg-face 'sgn-other-msg-face))
          (header (format "── %s · %s " name time-str))
          (fill (make-string (max 0 (- (window-width) (length header) 1)) ?─)))
     (insert (propertize (concat header fill "\n")
@@ -594,8 +599,7 @@ Handles grouping, headers, body, quotes, reactions, and media."
          (quote-body (plist-get msg :quote-body))
          (styles-json (plist-get msg :styles-json))
          (target-author sender)
-         (start (point))
-         (is-me (and sgn-account (equal sender sgn-account))))
+         (start (point)))
     ;; Quote block
     (when (and quote-ts quote-author)
       (sgn-chat--render-quote quote-author quote-body))
@@ -622,8 +626,7 @@ Handles grouping, headers, body, quotes, reactions, and media."
             (insert "  ")
             (let ((content-type (plist-get m :content-type))
                   (file-path (plist-get m :file-path))
-                  (is-voice (plist-get m :is-voice))
-                  (is-sticker (plist-get m :is-sticker)))
+                  (is-voice (plist-get m :is-voice)))
               (cond
                ((and is-voice (not (zerop is-voice)) file-path)
                 (sgn-media-insert-voice-note file-path 0))

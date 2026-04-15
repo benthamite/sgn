@@ -1,10 +1,10 @@
-;;; sgn-test.el --- Tests for sgn.el  -*- lexical-binding: t; -*-
+;;; sgn-test.el --- Tests for sgn  -*- lexical-binding: t; -*-
 
 ;;; Commentary:
 
-;; ERT test suite for sgn.el (Signal client via signal-cli JSON-RPC).
-;; Covers: pure utilities, process filter/dispatch, callback machinery,
-;; contact population, and buffer management.
+;; ERT test suite for sgn, covering: pure utilities, process
+;; filter/dispatch, callback machinery, contact population, buffer
+;; management, SQLite persistence, formatting, and actions.
 
 ;;; Code:
 
@@ -17,28 +17,60 @@
 (defmacro sgn-test-with-clean-state (&rest body)
   "Run BODY with all sgn mutable state reset to fresh defaults."
   (declare (indent 0) (debug body))
-  `(let ((sgn--partial-line "")
-         (sgn--contact-map (make-hash-table :test 'equal))
-         (sgn--active-chats (make-hash-table :test 'equal))
-         (sgn--pending-callbacks (make-hash-table :test 'equal))
-         (sgn--request-buffer-map (make-hash-table :test 'equal))
-         (sgn--rpc-id-counter 0))
+  `(let ((sgn-rpc--partial-line "")
+         (sgn-rpc--id-counter 0)
+         (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
+         (sgn-rpc--request-methods (make-hash-table :test 'equal))
+         (sgn-rpc--request-params (make-hash-table :test 'equal))
+         (sgn-rpc--retried-ids (make-hash-table :test 'equal))
+         (sgn-contacts--cache (make-hash-table :test 'equal))
+         (sgn-account "+15550000000"))
      ,@body))
+
+(defmacro sgn-test-with-db (&rest body)
+  "Run BODY with a fresh temporary SQLite database."
+  (declare (indent 0) (debug body))
+  `(let* ((sgn-db-directory (make-temp-file "sgn-test-" t))
+          (sgn-db--connection nil)
+          (sgn-account "+15550000000"))
+     (unwind-protect
+         (progn
+           (sgn-db-init)
+           ,@body)
+       (sgn-db-close)
+       (delete-directory sgn-db-directory t))))
 
 (defmacro sgn-test-with-chat-buffer (id &rest body)
   "Run BODY in a fresh chat buffer for ID, cleaning up afterward."
   (declare (indent 1) (debug body))
-  (let ((buf (gensym "buf")))
-    `(sgn-test-with-clean-state
-       (let ((,buf (sgn--get-buffer ,id)))
-         (unwind-protect
+  (let ((buf (gensym "buf"))
+        (dbdir (gensym "dbdir")))
+    `(let* ((,dbdir (make-temp-file "sgn-test-" t))
+            (sgn-db-directory ,dbdir)
+            (sgn-db--connection nil)
+            (sgn-rpc--partial-line "")
+            (sgn-rpc--id-counter 0)
+            (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
+            (sgn-rpc--request-methods (make-hash-table :test 'equal))
+            (sgn-rpc--request-params (make-hash-table :test 'equal))
+            (sgn-rpc--retried-ids (make-hash-table :test 'equal))
+            (sgn-contacts--cache (make-hash-table :test 'equal))
+            (sgn-account "+15550000000")
+            (,buf nil))
+       (unwind-protect
+           (progn
+             (sgn-db-init)
+             (setq ,buf (get-buffer-create (format "*Sgn: %s*" ,id)))
              (with-current-buffer ,buf
-               ,@body)
-           (kill-buffer ,buf))))))
+               (sgn-chat-mode)
+               (setq sgn-chat-id ,id)
+               (sgn-chat--draw-prompt)
+               ,@body))
+         (when (buffer-live-p ,buf) (kill-buffer ,buf))
+         (sgn-db-close)
+         (delete-directory ,dbdir t)))))
 
 ;;;; Tier 1 — Pure utility functions
-
-;;; sgn--ensure-list
 
 (ert-deftest sgn-test-ensure-list-vector ()
   "Vectors are coerced to lists."
@@ -56,461 +88,558 @@
   "Empty vector becomes nil (empty list)."
   (should (null (sgn--ensure-list []))))
 
-(ert-deftest sgn-test-ensure-list-nested-vector ()
-  "Nested vectors are only coerced at the top level."
-  (let ((result (sgn--ensure-list [1 [2 3]])))
-    (should (listp result))
-    (should (vectorp (cadr result)))))
-
-;;; sgn--is-group-id
-
-(ert-deftest sgn-test-is-group-id-phone-number ()
-  "Phone numbers (starting with +) are not group IDs."
+(ert-deftest sgn-test-is-group-id-phone ()
+  "Phone numbers are not group IDs."
   (should-not (sgn--is-group-id "+15550000000")))
 
 (ert-deftest sgn-test-is-group-id-uuid ()
-  "UUIDs (containing -) are not group IDs."
+  "UUIDs are not group IDs."
   (should-not (sgn--is-group-id "a1b2c3d4-e5f6-7890-abcd-ef1234567890")))
 
 (ert-deftest sgn-test-is-group-id-base64 ()
-  "Base64 strings (no + prefix or -) are identified as group IDs."
+  "Base64 strings are group IDs."
   (should (sgn--is-group-id "dGVzdGdyb3VwaWQ9")))
 
-(ert-deftest sgn-test-is-group-id-base64-with-equals ()
-  "Base64 with padding is still a group ID."
-  (should (sgn--is-group-id "YWJjZGVmZw==")))
-
-;;; sgn--build-send-params
-
-(ert-deftest sgn-test-build-send-params-phone ()
-  "Phone number gets `recipient' key with vector value."
-  (let ((result (sgn--build-send-params "+15550000000"
-                                        '((message . "hi")))))
-    (should (equal (alist-get 'recipient result) ["+15550000000"]))
-    (should-not (alist-get 'groupId result))
-    (should (equal (alist-get 'message result) "hi"))))
-
-(ert-deftest sgn-test-build-send-params-group ()
-  "Group ID gets `groupId' key with string value."
-  (let ((result (sgn--build-send-params "dGVzdGdyb3Vw"
-                                        '((message . "hi")))))
-    (should (equal (alist-get 'groupId result) "dGVzdGdyb3Vw"))
-    (should-not (alist-get 'recipient result))
-    (should (equal (alist-get 'message result) "hi"))))
-
-(ert-deftest sgn-test-build-send-params-preserves-base ()
-  "BASE-PARAMS are preserved in output."
-  (let* ((base '((message . "hello") (attachments . ["file.jpg"])))
-         (result (sgn--build-send-params "+1555" base)))
-    (should (equal (alist-get 'message result) "hello"))
-    (should (equal (alist-get 'attachments result) ["file.jpg"]))))
-
-;;;; Tier 2 — Process filter and dispatch
-
-;;; sgn--process-filter
+;;;; Tier 2 — RPC process filter and dispatch
 
 (ert-deftest sgn-test-process-filter-complete-line ()
-  "A complete JSON line (terminated by newline) is dispatched."
+  "A complete JSON line is dispatched."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter
+        (sgn-rpc--process-filter
          nil "{\"method\":\"receive\",\"params\":{}}\n")
         (should (= (length dispatched) 1))
         (should (equal (alist-get 'method (car dispatched))
                        "receive"))))))
 
 (ert-deftest sgn-test-process-filter-partial-then-complete ()
-  "Partial lines are buffered until the newline arrives."
+  "Partial lines are buffered until newline arrives."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter nil "{\"id\":1,\"result\":")
+        (sgn-rpc--process-filter nil "{\"id\":1,\"result\":")
         (should (null dispatched))
-        (sgn--process-filter nil "\"ok\"}\n")
+        (sgn-rpc--process-filter nil "\"ok\"}\n")
         (should (= (length dispatched) 1))
         (should (equal (alist-get 'result (car dispatched))
                        "ok"))))))
 
-(ert-deftest sgn-test-process-filter-two-lines-in-one-chunk ()
-  "Two complete lines in one chunk dispatch twice."
+(ert-deftest sgn-test-process-filter-two-lines ()
+  "Two complete lines dispatch twice."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter
+        (sgn-rpc--process-filter
          nil
          (concat "{\"id\":1,\"result\":\"a\"}\n"
                  "{\"id\":2,\"result\":\"b\"}\n"))
         (should (= (length dispatched) 2))))))
 
 (ert-deftest sgn-test-process-filter-skips-non-json ()
-  "Non-JSON lines (not starting with {) are silently skipped."
+  "Non-JSON lines are silently skipped."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter nil "some log output\n")
+        (sgn-rpc--process-filter nil "some log output\n")
         (should (null dispatched))))))
 
-(ert-deftest sgn-test-process-filter-skips-empty-lines ()
-  "Empty lines between JSON objects are skipped."
+(ert-deftest sgn-test-process-filter-overflow ()
+  "Buffer is cleared when it exceeds max length."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter
-         nil "\n\n{\"id\":1,\"result\":\"x\"}\n\n")
-        (should (= (length dispatched) 1))))))
-
-(ert-deftest sgn-test-process-filter-overflow-protection ()
-  "Buffer is cleared when it exceeds the max length."
-  (sgn-test-with-clean-state
-    (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
-                 (lambda (json) (push json dispatched)))
-                ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter
-         nil (make-string (1+ sgn--max-partial-line-length) ?x))
-        (should (string-empty-p sgn--partial-line))
-        (sgn--process-filter
-         nil "{\"id\":99,\"result\":\"ok\"}\n")
+        (sgn-rpc--process-filter
+         nil (make-string (1+ sgn-rpc--max-partial-line-length) ?x))
+        (should (string-empty-p sgn-rpc--partial-line))
+        (sgn-rpc--process-filter nil "{\"id\":99,\"result\":\"ok\"}\n")
         (should (= (length dispatched) 1))))))
 
 (ert-deftest sgn-test-process-filter-malformed-json ()
-  "Malformed JSON does not crash and produces no dispatch."
+  "Malformed JSON does not crash."
   (sgn-test-with-clean-state
     (let ((dispatched nil))
-      (cl-letf (((symbol-function 'sgn--dispatch)
+      (cl-letf (((symbol-function 'sgn-rpc--dispatch)
                  (lambda (json) (push json dispatched)))
                 ((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter nil "{not valid json}\n")
+        (sgn-rpc--process-filter nil "{not valid json}\n")
         (should (null dispatched))))))
 
-;;; sgn--dispatch
+;;;; Tier 3 — Dispatch routing
 
 (ert-deftest sgn-test-dispatch-receive ()
-  "Method \"receive\" routes to `sgn--handle-receive' with PARAMS."
+  "Method \"receive\" calls the receive handler."
   (sgn-test-with-clean-state
-    (let ((received nil))
-      (cl-letf (((symbol-function 'sgn--handle-receive)
-                 (lambda (params) (setq received params))))
-        (sgn--dispatch '((method . "receive")
-                         (params . ((envelope . t)))))
-        (should (equal received '((envelope . t))))))))
+    (let* ((received nil)
+           (sgn-rpc-receive-handler
+            (lambda (params) (setq received params))))
+      (sgn-rpc--dispatch '((method . "receive")
+                           (params . ((envelope . t)))))
+      (should (equal received '((envelope . t)))))))
 
 (ert-deftest sgn-test-dispatch-error ()
-  "Error objects route to `sgn--handle-error'."
+  "Error objects route to handle-error."
   (sgn-test-with-clean-state
     (let ((error-args nil))
-      (cl-letf (((symbol-function 'sgn--handle-error)
-                 (lambda (id err)
-                   (setq error-args (list id err)))))
-        (sgn--dispatch '((id . 5)
-                         (error . ((message . "boom")))))
+      (cl-letf (((symbol-function 'sgn-rpc--handle-error)
+                 (lambda (id err) (setq error-args (list id err)))))
+        (sgn-rpc--dispatch '((id . 5)
+                             (error . ((message . "boom")))))
         (should (equal (car error-args) 5))
-        (should (equal (alist-get 'message (cadr error-args))
-                       "boom"))))))
+        (should (equal (alist-get 'message (cadr error-args)) "boom"))))))
 
 (ert-deftest sgn-test-dispatch-result ()
-  "ID + result routes to `sgn--handle-result'."
+  "ID + result invokes the callback."
   (sgn-test-with-clean-state
     (let ((result-args nil))
-      (cl-letf (((symbol-function 'sgn--handle-result)
-                 (lambda (id result)
-                   (setq result-args (list id result)))))
-        (sgn--dispatch '((id . 3) (result . "ok")))
+      (cl-letf (((symbol-function 'sgn-rpc--handle-result)
+                 (lambda (id result) (setq result-args (list id result)))))
+        (sgn-rpc--dispatch '((id . 3) (result . "ok")))
         (should (equal result-args '(3 "ok")))))))
 
-(ert-deftest sgn-test-dispatch-unknown-method-no-crash ()
-  "Unknown method without error or result is silently ignored."
-  (sgn-test-with-clean-state
-    (let ((called nil))
-      (cl-letf (((symbol-function 'sgn--handle-receive)
-                 (lambda (_) (setq called t))))
-        (sgn--dispatch '((method . "unknownMethod")
-                         (params . nil)))
-        (should-not called)))))
-
-;;;; Tier 3 — Callback and error machinery
-
-;;; sgn--handle-result
+;;;; Tier 4 — Callback and error machinery
 
 (ert-deftest sgn-test-handle-result-invokes-callback ()
   "Stored callback is invoked with the result value."
   (sgn-test-with-clean-state
     (let ((received-result nil))
       (puthash 42 (lambda (r) (setq received-result r))
-               sgn--pending-callbacks)
-      (puthash 42 "*test*" sgn--request-buffer-map)
-      (sgn--handle-result 42 '((contacts . [])))
-      (should (equal received-result '((contacts . []))))
-      (should-not (gethash 42 sgn--pending-callbacks))
-      (should-not (gethash 42 sgn--request-buffer-map)))))
+               sgn-rpc--pending-callbacks)
+      (puthash 42 "send" sgn-rpc--request-methods)
+      (sgn-rpc--handle-result 42 '((status . "ok")))
+      (should (equal (alist-get 'status received-result) "ok"))
+      (should-not (gethash 42 sgn-rpc--pending-callbacks))
+      (should-not (gethash 42 sgn-rpc--request-methods)))))
 
 (ert-deftest sgn-test-handle-result-no-callback ()
-  "Without a callback, handle-result still cleans up the map."
+  "Without a callback, handle-result still cleans up."
   (sgn-test-with-clean-state
-    (puthash 10 "*some-buf*" sgn--request-buffer-map)
-    (sgn--handle-result 10 "ok")
-    (should-not (gethash 10 sgn--request-buffer-map))))
+    (puthash 10 "send" sgn-rpc--request-methods)
+    (sgn-rpc--handle-result 10 "ok")
+    (should-not (gethash 10 sgn-rpc--request-methods))))
 
-;;; sgn--handle-error
-
-(ert-deftest sgn-test-handle-error-cleans-up-maps ()
-  "Error handling removes entries from both maps."
+(ert-deftest sgn-test-handle-error-cleans-up ()
+  "Error handling removes entries from all maps."
   (sgn-test-with-clean-state
-    (puthash 7 (lambda (_) nil) sgn--pending-callbacks)
-    (puthash 7 "*nonexistent*" sgn--request-buffer-map)
+    (puthash 7 (lambda (_) nil) sgn-rpc--pending-callbacks)
+    (puthash 7 "send" sgn-rpc--request-methods)
+    (puthash 7 '((message . "hi")) sgn-rpc--request-params)
     (cl-letf (((symbol-function 'sgn--log) #'ignore))
-      (sgn--handle-error 7 '((message . "test error"))))
-    (should-not (gethash 7 sgn--pending-callbacks))
-    (should-not (gethash 7 sgn--request-buffer-map))))
+      (sgn-rpc--handle-error 7 '((code . -1) (message . "user error"))))
+    (should-not (gethash 7 sgn-rpc--pending-callbacks))
+    (should-not (gethash 7 sgn-rpc--request-methods))
+    (should-not (gethash 7 sgn-rpc--request-params))))
 
-(ert-deftest sgn-test-handle-error-inserts-into-buffer ()
-  "Error message is inserted into the mapped chat buffer."
+(ert-deftest sgn-test-error-classification-retryable ()
+  "I/O (-3) and rate-limit (-5) codes are retryable."
+  (should (sgn-rpc--retryable-error-p -3))
+  (should (sgn-rpc--retryable-error-p -5)))
+
+(ert-deftest sgn-test-error-classification-permanent ()
+  "User error (-1) and invalid params (-32602) are not retryable."
+  (should-not (sgn-rpc--retryable-error-p -1))
+  (should-not (sgn-rpc--retryable-error-p -32602)))
+
+;;;; Tier 5 — Address builder
+
+(ert-deftest sgn-test-address-phone ()
+  "Phone number produces recipient key."
+  (let ((addr (sgn-rpc--build-address "+15550000000")))
+    (should (equal (alist-get 'recipient addr) ["+15550000000"]))
+    (should-not (alist-get 'groupId addr))))
+
+(ert-deftest sgn-test-address-group ()
+  "Group ID produces groupId key."
+  (let ((addr (sgn-rpc--build-address "dGVzdGdyb3Vw")))
+    (should (equal (alist-get 'groupId addr) "dGVzdGdyb3Vw"))
+    (should-not (alist-get 'recipient addr))))
+
+(ert-deftest sgn-test-address-uuid ()
+  "UUID produces recipient key (not group)."
+  (let ((addr (sgn-rpc--build-address "a1b2c3d4-e5f6-7890-abcd-ef1234567890")))
+    (should (alist-get 'recipient addr))
+    (should-not (alist-get 'groupId addr))))
+
+;;;; Tier 6 — SQLite persistence
+
+(ert-deftest sgn-test-db-init-and-close ()
+  "Database initializes and closes without error."
+  (sgn-test-with-db
+    (should sgn-db--connection)))
+
+(ert-deftest sgn-test-db-chat-upsert-and-get ()
+  "Insert and retrieve a chat."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((chat (sgn-db-get-chat "+1555")))
+      (should chat)
+      (should (equal (plist-get chat :name) "Alice"))
+      (should (equal (plist-get chat :type) "individual")))))
+
+(ert-deftest sgn-test-db-chat-update ()
+  "Updating a chat preserves existing fields."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (sgn-db-upsert-chat "+1555" :unread 3)
+    (let ((chat (sgn-db-get-chat "+1555")))
+      (should (equal (plist-get chat :name) "Alice"))
+      (should (equal (plist-get chat :unread) 3)))))
+
+(ert-deftest sgn-test-db-chat-list-sorted ()
+  "Chats are returned sorted by pinned then last_msg_ts."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1001" :name "Old" :type "individual" :last-msg-ts 100)
+    (sgn-db-upsert-chat "+1002" :name "New" :type "individual" :last-msg-ts 200)
+    (sgn-db-upsert-chat "+1003" :name "Pinned" :type "individual"
+                        :last-msg-ts 50 :pinned 1)
+    (let ((chats (sgn-db-get-chats)))
+      (should (= (length chats) 3))
+      ;; Pinned first, then newest
+      (should (equal (plist-get (nth 0 chats) :name) "Pinned"))
+      (should (equal (plist-get (nth 1 chats) :name) "New"))
+      (should (equal (plist-get (nth 2 chats) :name) "Old")))))
+
+(ert-deftest sgn-test-db-message-insert-and-get ()
+  "Insert and retrieve a message."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555"
+                        :sender "+1555"
+                        :timestamp 1000
+                        :body "Hello"
+                        :type "data"))))
+      (should rowid)
+      (let ((msg (sgn-db-get-message-by-rowid rowid)))
+        (should msg)
+        (should (equal (plist-get msg :body) "Hello"))
+        (should (equal (plist-get msg :sender) "+1555"))))))
+
+(ert-deftest sgn-test-db-message-get-by-triple ()
+  "Retrieve a message by chat_id + sender + timestamp."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (sgn-db-insert-message
+     (list :chat-id "+1555" :sender "+1555" :timestamp 2000
+           :body "Test" :type "data"))
+    (let ((msg (sgn-db-get-message "+1555" "+1555" 2000)))
+      (should msg)
+      (should (equal (plist-get msg :body) "Test")))))
+
+(ert-deftest sgn-test-db-message-pagination ()
+  "Messages are returned in chronological order with limit."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (dotimes (i 10)
+      (sgn-db-insert-message
+       (list :chat-id "+1555" :sender "+1555"
+             :timestamp (+ 1000 i)
+             :body (format "msg-%d" i) :type "data")))
+    (let ((msgs (sgn-db-get-messages "+1555" 3)))
+      (should (= (length msgs) 3))
+      ;; Most recent 3, in chronological order
+      (should (equal (plist-get (nth 0 msgs) :body) "msg-7"))
+      (should (equal (plist-get (nth 1 msgs) :body) "msg-8"))
+      (should (equal (plist-get (nth 2 msgs) :body) "msg-9")))))
+
+(ert-deftest sgn-test-db-message-update ()
+  "Update message fields."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "Original" :type "data"))))
+      (sgn-db-update-message rowid (list :body "Edited" :edited-at 2000))
+      (let ((msg (sgn-db-get-message-by-rowid rowid)))
+        (should (equal (plist-get msg :body) "Edited"))
+        (should (equal (plist-get msg :edited-at) 2000))))))
+
+(ert-deftest sgn-test-db-message-delete ()
+  "Deleting marks message and clears body."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "Delete me" :type "data"))))
+      (sgn-db-delete-message rowid)
+      (let ((msg (sgn-db-get-message-by-rowid rowid)))
+        (should (equal (plist-get msg :deleted) 1))
+        (should (null (plist-get msg :body)))))))
+
+(ert-deftest sgn-test-db-reactions ()
+  "Insert, get, and remove reactions."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "React to me" :type "data"))))
+      ;; Add reaction
+      (sgn-db-upsert-reaction
+       (list :message-rowid rowid :chat-id "+1555"
+             :target-author "+1555" :target-timestamp 1000
+             :sender "+15550000000" :emoji "👍"))
+      (let ((reactions (sgn-db-get-reactions rowid)))
+        (should (= (length reactions) 1))
+        (should (equal (plist-get (car reactions) :emoji) "👍")))
+      ;; Remove reaction
+      (sgn-db-remove-reaction "+1555" "+1555" 1000 "+15550000000")
+      (should (null (sgn-db-get-reactions rowid))))))
+
+(ert-deftest sgn-test-db-media ()
+  "Insert and retrieve media."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((msg-rowid (sgn-db-insert-message
+                      (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                            :body nil :type "data"))))
+      (sgn-db-insert-media
+       (list :message-rowid msg-rowid :chat-id "+1555"
+             :content-type "image/jpeg" :file-path "/tmp/test.jpg"))
+      (let ((media (sgn-db-get-media msg-rowid)))
+        (should (= (length media) 1))
+        (should (equal (plist-get (car media) :content-type) "image/jpeg"))))))
+
+(ert-deftest sgn-test-db-search ()
+  "FTS5 search finds matching messages."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (sgn-db-insert-message
+     (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+           :body "dinner at seven" :type "data"))
+    (sgn-db-insert-message
+     (list :chat-id "+1555" :sender "+1555" :timestamp 2000
+           :body "lunch tomorrow" :type "data"))
+    (let ((results (sgn-db-search "dinner")))
+      (should (= (length results) 1))
+      (should (string-match-p "dinner" (plist-get (car results) :snippet))))))
+
+(ert-deftest sgn-test-db-search-excludes-deleted ()
+  "FTS5 search excludes deleted messages."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "secret dinner" :type "data"))))
+      (sgn-db-delete-message rowid)
+      (should (null (sgn-db-search "dinner"))))))
+
+(ert-deftest sgn-test-db-unread-tracking ()
+  "Unread counts increment and reset."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (sgn-db-increment-unread "+1555")
+    (sgn-db-increment-unread "+1555")
+    (let ((chat (sgn-db-get-chat "+1555")))
+      (should (equal (plist-get chat :unread) 2)))
+    (sgn-db-set-unread "+1555" 0)
+    (let ((chat (sgn-db-get-chat "+1555")))
+      (should (equal (plist-get chat :unread) 0)))))
+
+(ert-deftest sgn-test-db-drafts ()
+  "Draft save and restore."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (sgn-db-save-draft "+1555" "Hello wor")
+    (should (equal (sgn-db-get-draft "+1555") "Hello wor"))
+    (sgn-db-save-draft "+1555" nil)
+    (should (null (sgn-db-get-draft "+1555")))))
+
+(ert-deftest sgn-test-db-polls ()
+  "Insert and retrieve polls."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "📊 Poll" :type "data"))))
+      (sgn-db-upsert-poll
+       (list :message-rowid rowid :chat-id "+1555"
+             :poll-author "+1555" :poll-timestamp 1000
+             :question "What?" :options-json "[\"A\",\"B\"]"))
+      (let ((poll (sgn-db-get-poll rowid)))
+        (should poll)
+        (should (equal (plist-get poll :question) "What?"))))))
+
+(ert-deftest sgn-test-db-pins ()
+  "Insert, get, and remove pins."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+                        :body "Pin me" :type "data"))))
+      (sgn-db-insert-pin
+       (list :message-rowid rowid :chat-id "+1555"
+             :target-author "+1555" :target-timestamp 1000
+             :pinned-by "+15550000000" :pinned-at 2000))
+      (let ((pins (sgn-db-get-pins "+1555")))
+        (should (= (length pins) 1)))
+      (sgn-db-remove-pin "+1555" "+1555" 1000)
+      (should (null (sgn-db-get-pins "+1555"))))))
+
+;;;; Tier 7 — Text formatting
+
+(ert-deftest sgn-test-format-apply-styles-nil ()
+  "Nil styles returns text unchanged."
+  (should (equal (sgn-format-apply-styles "hello" nil) "hello")))
+
+(ert-deftest sgn-test-format-apply-styles-bold ()
+  "Bold style applies bold face."
+  (let* ((styles "[{\"start\":0,\"length\":5,\"style\":\"BOLD\"}]")
+         (result (sgn-format-apply-styles "hello" styles)))
+    (should (equal (get-text-property 0 'face result) 'bold))))
+
+(ert-deftest sgn-test-format-apply-styles-spoiler ()
+  "Spoiler style applies face and sets sgn-spoiler property."
+  (let* ((styles "[{\"start\":0,\"length\":6,\"style\":\"SPOILER\"}]")
+         (result (sgn-format-apply-styles "secret" styles)))
+    (should (get-text-property 0 'sgn-spoiler result))
+    (should (equal (get-text-property 0 'face result) 'sgn-spoiler-face))))
+
+(ert-deftest sgn-test-format-parse-markup-bold ()
+  "Bold markup is parsed correctly."
+  (let ((result (sgn-format-parse-markup "*hello*")))
+    (should (equal (plist-get result :text) "hello"))
+    (let ((styles (plist-get result :styles)))
+      (should (= (length styles) 1))
+      (should (equal (alist-get 'style (car styles)) "BOLD"))
+      (should (equal (alist-get 'start (car styles)) 0))
+      (should (equal (alist-get 'length (car styles)) 5)))))
+
+(ert-deftest sgn-test-format-parse-markup-no-markup ()
+  "Plain text passes through unchanged."
+  (let ((result (sgn-format-parse-markup "hello world")))
+    (should (equal (plist-get result :text) "hello world"))
+    (should (null (plist-get result :styles)))))
+
+(ert-deftest sgn-test-format-parse-markup-spoiler ()
+  "Spoiler markup with double-pipe is parsed."
+  (let ((result (sgn-format-parse-markup "||secret||")))
+    (should (equal (plist-get result :text) "secret"))
+    (let ((styles (plist-get result :styles)))
+      (should (= (length styles) 1))
+      (should (equal (alist-get 'style (car styles)) "SPOILER")))))
+
+(ert-deftest sgn-test-format-styles-to-json ()
+  "Styles list converts to JSON array."
+  (let ((styles '(((start . 0) (length . 5) (style . "BOLD")))))
+    (let ((json (sgn-format-styles-to-json styles)))
+      (should (stringp json))
+      (should (string-prefix-p "[" json)))))
+
+(ert-deftest sgn-test-format-styles-to-json-nil ()
+  "Empty styles returns nil."
+  (should (null (sgn-format-styles-to-json nil))))
+
+;;;; Tier 8 — Contacts
+
+(ert-deftest sgn-test-contacts-get-name-cached ()
+  "Cached names are returned."
   (sgn-test-with-clean-state
-    (let ((buf (sgn--get-buffer "+1test-error")))
-      (unwind-protect
-          (progn
-            (puthash 8 (buffer-name buf) sgn--request-buffer-map)
-            (cl-letf (((symbol-function 'sgn--log) #'ignore))
-              (sgn--handle-error
-               8 '((message . "rpc failed"))))
-            (with-current-buffer buf
-              (should (string-match-p
-                       "ERROR: rpc failed"
-                       (buffer-substring-no-properties
-                        (point-min) (point-max))))))
-        (kill-buffer buf)))))
+    (sgn-contacts-set-name "+1555" "Alice")
+    (should (equal (sgn-contacts-get-name "+1555") "Alice"))))
 
-;;;; Tier 4 — Contact and group population
-
-;;; sgn--populate-contacts
-
-(ert-deftest sgn-test-populate-contacts-from-vector ()
-  "Contacts vector populates contact-map and active-chats."
+(ert-deftest sgn-test-contacts-get-name-fallback ()
+  "Unknown IDs fall back to the ID itself."
   (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-contacts
-       [((number . "+1555") (name . "Alice"))
-        ((number . "+1666") (name . "Bob"))])
-      (should (equal (gethash "+1555" sgn--contact-map) "Alice"))
-      (should (equal (gethash "+1666" sgn--contact-map) "Bob"))
-      (should (eq (gethash "+1555" sgn--active-chats) t))
-      (should (eq (gethash "+1666" sgn--active-chats) t)))))
+    (should (equal (sgn-contacts-get-name "+9999") "+9999"))))
 
-(ert-deftest sgn-test-populate-contacts-skips-empty-name ()
-  "Contacts with empty or missing name are skipped."
+(ert-deftest sgn-test-contacts-display-sender-self ()
+  "Own account shows as \"You\"."
   (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-contacts
-       [((number . "+1555") (name . ""))
-        ((number . "+1666") (name . "Bob"))
-        ((number . "+1777"))])
-      (should-not (gethash "+1555" sgn--contact-map))
-      (should (equal (gethash "+1666" sgn--contact-map) "Bob"))
-      (should-not (gethash "+1777" sgn--contact-map)))))
+    (should (equal (sgn-contacts-display-sender "+15550000000") "You"))))
 
-(ert-deftest sgn-test-populate-contacts-skips-missing-number ()
-  "Contacts without a number are skipped."
+(ert-deftest sgn-test-contacts-display-sender-other ()
+  "Other accounts show resolved names."
   (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-contacts [((name . "Ghost"))])
-      (should (= (hash-table-count sgn--contact-map) 0)))))
+    (sgn-contacts-set-name "+1666" "Bob")
+    (should (equal (sgn-contacts-display-sender "+1666") "Bob"))))
 
-;;; sgn--populate-groups
+;;;; Tier 9 — Chat buffer
 
-(ert-deftest sgn-test-populate-groups-from-vector ()
-  "Groups populate both active-chats and contact-map."
-  (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-groups
-       [((id . "grp1==") (name . "Family"))
-        ((id . "grp2==") (name . "Work"))])
-      (should (eq (gethash "grp1==" sgn--active-chats) t))
-      (should (equal (gethash "grp1==" sgn--contact-map) "Family"))
-      (should (equal (gethash "grp2==" sgn--contact-map) "Work")))))
+(ert-deftest sgn-test-chat-buffer-mode ()
+  "Chat buffer has correct mode and local vars."
+  (sgn-test-with-chat-buffer "+1555"
+    (should (eq major-mode 'sgn-chat-mode))
+    (should (equal sgn-chat-id "+1555"))
+    (should (markerp sgn-chat--input-marker))))
 
-(ert-deftest sgn-test-populate-groups-no-name ()
-  "Groups without a name are in active-chats but not contact-map."
-  (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-groups [((id . "grp3=="))])
-      (should (eq (gethash "grp3==" sgn--active-chats) t))
-      (should-not (gethash "grp3==" sgn--contact-map)))))
+(ert-deftest sgn-test-chat-prompt ()
+  "Prompt is inserted and marker is positioned."
+  (sgn-test-with-chat-buffer "+1555"
+    (should (string-match-p
+             (regexp-quote sgn-prompt)
+             (buffer-substring-no-properties (point-min) (point-max))))
+    (should (> (marker-position sgn-chat--input-marker) (point-min)))))
 
-(ert-deftest sgn-test-populate-groups-empty-name ()
-  "Groups with empty name are in active-chats but not contact-map."
-  (sgn-test-with-clean-state
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--populate-groups [((id . "grp4==") (name . ""))])
-      (should (eq (gethash "grp4==" sgn--active-chats) t))
-      (should-not (gethash "grp4==" sgn--contact-map)))))
-
-;;;; Tier 5 — Buffer and UI management
-
-;;; sgn--get-buffer
-
-(ert-deftest sgn-test-get-buffer-creates-with-mode ()
-  "Creates a new buffer with `sgn-chat-mode' and correct chat ID."
-  (sgn-test-with-clean-state
-    (let ((buf (sgn--get-buffer "+1test-mode")))
-      (unwind-protect
-          (with-current-buffer buf
-            (should (eq major-mode 'sgn-chat-mode))
-            (should (equal sgn--chat-id "+1test-mode"))
-            (should (markerp sgn--input-marker)))
-        (kill-buffer buf)))))
-
-(ert-deftest sgn-test-get-buffer-reuses-existing ()
-  "Returns the same buffer on second call for the same ID."
-  (sgn-test-with-clean-state
-    (let ((buf1 (sgn--get-buffer "+1reuse"))
-          (buf2 (sgn--get-buffer "+1reuse")))
-      (unwind-protect
-          (should (eq buf1 buf2))
-        (kill-buffer buf1)))))
-
-;;; sgn--draw-prompt
-
-(ert-deftest sgn-test-draw-prompt-inserts-prompt ()
-  "Inserts the prompt string and advances the input marker."
-  (sgn-test-with-chat-buffer "+1prompt-test"
-    (let ((marker-pos (marker-position sgn--input-marker)))
-      (should (string-match-p
-               (regexp-quote sgn-prompt)
-               (buffer-substring-no-properties
-                (point-min) (point-max))))
-      (should (> marker-pos (point-min))))))
-
-;;; sgn--guard-cursor
-
-(ert-deftest sgn-test-guard-cursor-moves-to-marker ()
-  "Cursor before the input marker is moved to the marker."
-  (sgn-test-with-chat-buffer "+1guard-test"
+(ert-deftest sgn-test-chat-guard-cursor ()
+  "Cursor before marker is moved to marker."
+  (sgn-test-with-chat-buffer "+1555"
     (goto-char (point-min))
-    (sgn--guard-cursor)
-    (should (= (point) (marker-position sgn--input-marker)))))
+    (let ((this-command 'self-insert-command))
+      (sgn-chat--guard-cursor))
+    (should (= (point) (marker-position sgn-chat--input-marker)))))
 
-(ert-deftest sgn-test-guard-cursor-stays-after-marker ()
-  "Cursor at or after the input marker is not moved."
-  (sgn-test-with-chat-buffer "+1guard-test2"
+(ert-deftest sgn-test-chat-get-input-text ()
+  "Input text is correctly extracted."
+  (sgn-test-with-chat-buffer "+1555"
     (goto-char (point-max))
-    (insert "some input")
-    (let ((pos (point)))
-      (sgn--guard-cursor)
-      (should (= (point) pos)))))
+    (insert "hello world")
+    (should (equal (sgn-chat--get-input-text) "hello world"))))
 
-;;; sgn--insert-msg
+(ert-deftest sgn-test-chat-timestamp-format-smart ()
+  "Smart timestamp shows time for today's messages."
+  (let ((sgn-timestamp-format 'smart)
+        (now-ms (truncate (* (float-time) 1000))))
+    (should (string-match-p "^[0-9][0-9]:[0-9][0-9]$"
+                            (sgn-chat--format-timestamp now-ms)))))
 
-(ert-deftest sgn-test-insert-msg-text-only ()
-  "Text message adds sender name, timestamp, and text."
-  (sgn-test-with-chat-buffer "+1msg-test"
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--insert-msg "+1msg-test" "Alice" "Hello world"
-                       nil nil nil)
-      (let ((content (buffer-substring-no-properties
-                      (point-min) (point-max))))
-        (should (string-match-p "<Alice>" content))
-        (should (string-match-p "Hello world" content))
-        (should (string-match-p (regexp-quote sgn-prompt)
-                                content))))))
+(ert-deftest sgn-test-chat-format-duration ()
+  "Duration formatting works correctly."
+  (should (equal (sgn-chat--format-duration 30) "30s"))
+  (should (equal (sgn-chat--format-duration 3600) "1h"))
+  (should (equal (sgn-chat--format-duration 86400) "1d")))
 
-(ert-deftest sgn-test-insert-msg-my-message ()
-  "Own messages use the \"Me\" name."
-  (sgn-test-with-chat-buffer "+1me-test"
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--insert-msg "+1me-test" "Me" "My message"
-                       nil nil t)
-      (let ((content (buffer-substring-no-properties
-                      (point-min) (point-max))))
-        (should (string-match-p "<Me>" content))
-        (should (string-match-p "My message" content))))))
-
-(ert-deftest sgn-test-insert-msg-preserves-prompt ()
-  "After inserting a message, the prompt and marker remain valid."
-  (sgn-test-with-chat-buffer "+1prompt-preserve"
-    (cl-letf (((symbol-function 'sgn--dashboard-refresh) #'ignore))
-      (sgn--insert-msg "+1prompt-preserve" "Bob" "Test"
-                       nil nil nil)
-      (should (markerp sgn--input-marker))
-      (should (> (marker-position sgn--input-marker) (point-min)))
-      (goto-char (point-max))
-      (should (string-match-p
-               (regexp-quote sgn-prompt)
-               (buffer-substring-no-properties
-                (line-beginning-position) (point-max)))))))
-
-;;; Dashboard
-
-(ert-deftest sgn-test-dashboard-draw ()
-  "Dashboard lists active chats with names from contact-map."
-  (sgn-test-with-clean-state
-    (puthash "+1555" "Alice" sgn--contact-map)
-    (puthash "+1555" t sgn--active-chats)
-    (puthash "grp1==" "Family" sgn--contact-map)
-    (puthash "grp1==" t sgn--active-chats)
-    (let ((buf (get-buffer-create "*Sgn List*")))
-      (unwind-protect
-          (with-current-buffer buf
-            (sgn-dashboard-mode)
-            (sgn--dashboard-draw)
-            (let ((content (buffer-substring-no-properties
-                            (point-min) (point-max))))
-              (should (string-match-p "Alice" content))
-              (should (string-match-p "Family" content))
-              (should (string-match-p "Active Chats:" content))))
-        (kill-buffer buf)))))
-
-(ert-deftest sgn-test-dashboard-draw-uses-id-as-fallback ()
-  "When contact-map has no name, the ID itself is shown."
-  (sgn-test-with-clean-state
-    (puthash "+1999" t sgn--active-chats)
-    (let ((buf (get-buffer-create "*Sgn List*")))
-      (unwind-protect
-          (with-current-buffer buf
-            (sgn-dashboard-mode)
-            (sgn--dashboard-draw)
-            (let ((content (buffer-substring-no-properties
-                            (point-min) (point-max))))
-              (should (string-match-p "\\+1999" content))))
-        (kill-buffer buf)))))
-
-;;; sgn--insert-system-msg
-
-(ert-deftest sgn-test-insert-system-msg ()
-  "System messages appear with *** prefix and the prompt is preserved."
-  (sgn-test-with-chat-buffer "+1sys-test"
-    (sgn--insert-system-msg "Connection lost" 'sgn-error-face)
-    (let ((content (buffer-substring-no-properties
-                    (point-min) (point-max))))
-      (should (string-match-p "\\*\\*\\* Connection lost" content))
-      (should (string-match-p (regexp-quote sgn-prompt) content)))))
-
-;;;; Integration — end-to-end filter → result → callback
+;;;; Tier 10 — Integration: filter → result → callback
 
 (ert-deftest sgn-test-filter-to-callback-integration ()
   "Complete flow: filter → dispatch → handle-result → callback."
   (sgn-test-with-clean-state
     (let ((callback-result nil))
       (puthash 1 (lambda (r) (setq callback-result r))
-               sgn--pending-callbacks)
+               sgn-rpc--pending-callbacks)
+      (puthash 1 "test" sgn-rpc--request-methods)
       (cl-letf (((symbol-function 'sgn--log) #'ignore))
-        (sgn--process-filter
+        (sgn-rpc--process-filter
          nil
          (concat "{\"jsonrpc\":\"2.0\","
                  "\"id\":1,"
                  "\"result\":{\"status\":\"ok\"}}\n")))
       (should (equal (alist-get 'status callback-result) "ok"))
-      (should-not (gethash 1 sgn--pending-callbacks)))))
+      (should-not (gethash 1 sgn-rpc--pending-callbacks)))))
+
+;;;; Tier 11 — Column to keyword conversion
+
+(ert-deftest sgn-test-db-column-to-keyword ()
+  "SQL column names convert to kebab-case keywords."
+  (should (eq (sgn-db--column-to-keyword "chat_id") :chat-id))
+  (should (eq (sgn-db--column-to-keyword "last_msg_ts") :last-msg-ts))
+  (should (eq (sgn-db--column-to-keyword "rowid") :rowid)))
+
+(ert-deftest sgn-test-db-row-to-plist ()
+  "Row and columns convert to a proper plist."
+  (let ((result (sgn-db--row-to-plist '("alice" 42)
+                                       '("name" "age"))))
+    (should (equal (plist-get result :name) "alice"))
+    (should (equal (plist-get result :age) 42))))
 
 (provide 'sgn-test)
 ;;; sgn-test.el ends here

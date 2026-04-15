@@ -121,6 +121,7 @@ data message regardless of Emacs focus."
 (require 'sgn-actions)
 (require 'sgn-notify)
 (require 'sgn-search)
+(require 'sgn-import)
 (require 'sgn-dashboard)
 
 ;;;; Utility

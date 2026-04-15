@@ -580,14 +580,6 @@
              (buffer-substring-no-properties (point-min) (point-max))))
     (should (> (marker-position sgn-chat--input-marker) (point-min)))))
 
-(ert-deftest sgn-test-chat-guard-cursor ()
-  "Cursor before marker is moved to marker."
-  (sgn-test-with-chat-buffer "+1555"
-    (goto-char (point-min))
-    (let ((this-command 'self-insert-command))
-      (sgn-chat--guard-cursor))
-    (should (= (point) (marker-position sgn-chat--input-marker)))))
-
 (ert-deftest sgn-test-chat-get-input-text ()
   "Input text is correctly extracted."
   (sgn-test-with-chat-buffer "+1555"

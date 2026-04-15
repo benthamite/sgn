@@ -159,26 +159,26 @@ Keys: :timestamp :rowid :body")
 
 ;;;; Keymap
 
-(defvar sgn-chat-mode-map
-  (let ((map (make-sparse-keymap)))
-    ;; Input area
-    (define-key map (kbd "RET") #'sgn-chat-send-input)
-    (define-key map (kbd "S-<return>") #'newline)
-    (define-key map (kbd "C-j") #'newline)
-    (define-key map (kbd "C-c C-a") #'sgn-attach-file)
-    (define-key map (kbd "C-c C-v") #'sgn-send-voice-note)
-    (define-key map (kbd "C-g") #'sgn-chat-cancel-action)
-    ;; Read-only message area (these work via post-command remapping)
-    (define-key map (kbd "r") #'sgn-react)
-    (define-key map (kbd "q") #'sgn-reply)
-    (define-key map (kbd "e") #'sgn-edit)
-    (define-key map (kbd "d") #'sgn-delete)
-    (define-key map (kbd "f") #'sgn-forward)
-    (define-key map (kbd "P") #'sgn-toggle-pin)
-    (define-key map (kbd "c") #'sgn-copy-text)
-    (define-key map (kbd "g") #'sgn-load-more-history)
-    map)
+(defvar sgn-chat-mode-map nil
   "Keymap for `sgn-chat-mode'.")
+
+(setq sgn-chat-mode-map
+      (let ((map (make-sparse-keymap)))
+        (define-key map (kbd "RET") #'sgn-chat-send-input)
+        (define-key map (kbd "S-<return>") #'newline)
+        (define-key map (kbd "C-j") #'newline)
+        (define-key map (kbd "C-c C-a") #'sgn-attach-file)
+        (define-key map (kbd "C-c C-v") #'sgn-send-voice-note)
+        (define-key map (kbd "C-g") #'sgn-chat-cancel-action)
+        (define-key map (kbd "r") #'sgn-react)
+        (define-key map (kbd "q") #'sgn-reply)
+        (define-key map (kbd "e") #'sgn-edit)
+        (define-key map (kbd "d") #'sgn-delete)
+        (define-key map (kbd "f") #'sgn-forward)
+        (define-key map (kbd "P") #'sgn-toggle-pin)
+        (define-key map (kbd "c") #'sgn-copy-text)
+        (define-key map (kbd "g") #'sgn-load-more-history)
+        map))
 
 ;;;; Major mode
 

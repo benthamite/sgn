@@ -122,9 +122,8 @@ newline-terminated JSON object is available for parsing.")
 
 (defun sgn-rpc-start ()
   "Start the signal-cli JSON-RPC subprocess.
-Cleans up any existing process state before starting.  The process
-is started with `--receive-mode=manual', which means no messages
-are delivered until `sgn-rpc-subscribe-receive' is called."
+Cleans up any existing process state before starting.  In jsonRpc
+mode, signal-cli receives messages automatically."
   (unless sgn-cli-program
     (user-error "Variable `sgn-cli-program' is not set"))
   (unless (executable-find sgn-cli-program)
@@ -147,13 +146,12 @@ are delivered until `sgn-rpc-subscribe-receive' is called."
                :buffer sgn-rpc--buffer-stderr
                :command (list sgn-cli-program
                              "-a" sgn-account
-                             "--receive-mode=manual"
                              "jsonRpc")
                :filter #'sgn-rpc--process-filter
                :sentinel #'sgn-rpc--process-sentinel
                :coding 'utf-8-unix)))
     (set-process-query-on-exit-flag proc nil)
-    (sgn--log "Sgn RPC process started (receive-mode=manual).")
+    (sgn--log "Sgn RPC process started.")
     (message "Sgn service started.")))
 
 (defun sgn-rpc-stop ()
@@ -332,13 +330,10 @@ Everything else is treated as a base64 group ID and produces
 
 ;;; Subscribe receive
 
-(defun sgn-rpc-subscribe-receive (&optional callback)
-  "Call the subscribeReceive RPC method to begin receiving messages.
-This must be called after initialization is complete (contacts
-loaded, groups synced, etc.) because the process is started with
-`--receive-mode=manual'.  If CALLBACK is non-nil, it is called
-with the result."
-  (sgn-rpc-send "subscribeReceive" nil callback))
+(defun sgn-rpc-subscribe-receive (&optional _callback)
+  "No-op for compatibility.
+In jsonRpc mode signal-cli receives messages automatically."
+  nil)
 
 ;;; Convenience functions for specific RPC methods
 

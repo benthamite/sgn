@@ -5,8 +5,8 @@
 ;; Author: Keenan Salandy <keenan@salandy.dev>
 ;; Maintainer: Pablo Stafforini <pablo@stafforini.com>
 ;; URL: https://github.com/benthamite/sgn
-;; Version: 0.1.0
-;; Package-Requires: ((emacs "27.1"))
+;; Version: 0.2.0
+;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is NOT a part of GNU Emacs.
 
@@ -25,142 +25,76 @@
 
 ;;; Commentary:
 
-;; Sgn.el provides a lightweight, text-based interface for Signal. It
-;; communicates with a running `signal-cli' daemon via JSON-RPC.
+;; Sgn provides a full-featured Signal messenger client for Emacs,
+;; communicating with a running `signal-cli' daemon via JSON-RPC.
 ;;
 ;; Features:
-;; - Strict chat buffers (read-only history, guarded prompt).
-;; - Inline image rendering.
-;; - Sticker support (APNG->GIF conversion for animation).
-;; - Auto-refreshing dashboard of active chats.
-;; - Native Emacs desktop notifications.
+;; - Telega-style chat buffers with message grouping and text properties.
+;; - SQLite persistence for message history and full-text search (FTS5).
+;; - Inline image/sticker rendering, voice notes, link previews.
+;; - Reactions, replies, message editing and deletion.
+;; - Dashboard (chat list) with unread counts and pinned chats.
+;; - Desktop notifications and modeline/tab-bar unread indicator.
 ;;
 ;; Prerequisites:
-;; 1. signal-cli installed and in $PATH.
-;; 2. A registered/linked Signal account.
-;; 3. For animated stickers: `imagemagick' (specifically the `convert' command)
-;;    must be available in your PATH.
+;; 1. Emacs 29.1+ compiled with SQLite support.
+;; 2. signal-cli v0.14+ installed and in $PATH.
+;; 3. A registered/linked Signal account.
+;; 4. Optional: ImageMagick (`convert') for animated stickers.
 
 ;;; Code:
 
-(require 'json)
 (require 'cl-lib)
-(require 'notifications)
-(require 'button)
-(require 'image)
+(require 'json)
 
-;;; Configuration
+;;;; Custom group
 
 (defgroup sgn nil
   "Signal client for Emacs using signal-cli."
   :group 'comm
   :prefix "sgn-")
 
+;;;; Core customization
+
 (defcustom sgn-account nil
   "The registered Signal phone number (e.g. +15550000000).
 This must match the account registered with signal-cli."
-  :type '(choice (const :tag "Not Set" nil) string))
+  :type '(choice (const :tag "Not set" nil) string)
+  :group 'sgn)
 
 (defcustom sgn-cli-program (or (executable-find "signal-cli") "signal-cli")
-  "Path to the signal-cli executable.
-This program is a runtime dependency.  If it is in your variable `exec-path',
-this is automatically set.  Otherwise, you must provide the absolute path."
-  :type 'file)
+  "Path to the signal-cli executable."
+  :type 'file
+  :group 'sgn)
 
 (defcustom sgn-data-directory (expand-file-name "~/.local/share/signal-cli")
-  "Directory where signal-cli stores data (attachments, stickers, etc.).
-Default on Linux is typically ~/.local/share/signal-cli."
-  :type 'directory)
+  "Directory where signal-cli stores data (attachments, stickers, etc.)."
+  :type 'directory
+  :group 'sgn)
 
-(defcustom sgn-enable-animation t
-  "If non-nil, animate stickers and GIFs in the chat buffer.
-When nil, only the first frame of animated media will be displayed."
-  :type 'boolean)
+(defcustom sgn-auto-open-buffer nil
+  "If non-nil, auto-switch to chat buffer on incoming message."
+  :type 'boolean
+  :group 'sgn)
 
-(defcustom sgn-prompt "> "
-  "The prompt string displayed in chat buffers."
-  :type 'string)
+(defcustom sgn-send-read-receipts t
+  "If non-nil, send focus-gated read receipts via `sendReceipt'."
+  :type 'boolean
+  :group 'sgn)
 
-(defcustom sgn-auto-open-buffer t
-  "If non-nil, automatically display the chat buffer when a message arrives."
-  :type 'boolean)
+(defcustom sgn-cli-auto-read-receipts nil
+  "If non-nil, pass `--send-read-receipts' to signal-cli.
+When enabled, signal-cli sends read receipts for every incoming
+data message regardless of Emacs focus."
+  :type 'boolean
+  :group 'sgn)
 
-;;; Faces
+(defcustom sgn-send-typing t
+  "If non-nil, send typing indicators."
+  :type 'boolean
+  :group 'sgn)
 
-(defface sgn-my-msg-face
-  '((t :inherit font-lock-function-name-face))
-  "Face applied to your own messages.")
-
-(defface sgn-other-msg-face
-  '((t :inherit font-lock-variable-name-face))
-  "Face applied to messages from other users.")
-
-(defface sgn-timestamp-face
-  '((t :inherit shadow))
-  "Face for message timestamps.")
-
-(defface sgn-error-face
-  '((t :inherit error))
-  "Face for error messages.")
-
-;;; Internal State
-
-(defconst sgn--process-name "signal-rpc"
-  "Internal name for the signal-cli process.")
-
-(defconst sgn--max-partial-line-length 100000
-  "Maximum bytes to buffer before discarding an incomplete JSON line.
-Prevents unbounded memory growth if signal-cli emits a very long
-line without a terminating newline.")
-
-(defconst sgn--contact-refresh-delay 2
-  "Seconds to wait after process start before refreshing contacts.
-Gives signal-cli time to initialize its JSON-RPC interface.")
-
-(defconst sgn--sticker-max-width 150
-  "Max pixel width for sticker images (smaller than general media).")
-
-(defconst sgn--image-max-width 400
-  "Default max pixel width for inline images.")
-
-(defconst sgn--temp-file-cleanup-delay "5 sec"
-  "Delay before deleting temporary converted sticker files.
-Gives Emacs time to read and render the image before removal.")
-
-(defconst sgn--sticker-fallback-emoji "🧩"
-  "Emoji shown when a sticker lacks its own emoji metadata.")
-
-(defconst sgn--buffer-stderr " *sgn-stderr*"
-  "Name of the hidden buffer used for process stderr.")
-
-(defvar sgn--rpc-id-counter 0
-  "Counter for JSON-RPC request IDs.")
-
-(defvar sgn--request-buffer-map (make-hash-table :test 'equal)
-  "Mapping of RPC ID to buffer name for error reporting.")
-
-(defvar sgn--contact-map (make-hash-table :test 'equal)
-  "Cache of Signal IDs to display names.
-Keys are phone numbers (for contacts) or base64 group IDs
-\(for groups).  Values are human-readable names.")
-
-(defvar sgn--active-chats (make-hash-table :test 'equal)
-  "Hash table used as a set of currently active chat IDs.
-Keys are Signal IDs; values are always t.")
-
-(defvar sgn--partial-line ""
-  "Buffer string for incomplete JSON lines received from the process.")
-
-(defun sgn--ensure-list (value)
-  "Coerce VALUE to a list if it is a vector.
-`json-read' returns JSON arrays as vectors; this normalizes them
-for `dolist' iteration."
-  (if (vectorp value) (append value nil) value))
-
-(defvar sgn--pending-callbacks (make-hash-table :test 'equal)
-  "Mapping of RPC ID to callback function for handling responses.")
-
-;;; Logging
+;;;; Logging
 
 (defun sgn--log (fmt &rest args)
   "Log debug info to *sgn-log* using FMT and ARGS."
@@ -170,558 +104,530 @@ for `dolist' iteration."
     (insert (apply #'format fmt args))
     (insert "\n")))
 
+;;;###autoload
 (defun sgn-show-log ()
   "Display the debug log buffer."
   (interactive)
   (display-buffer (get-buffer-create "*sgn-log*")))
 
-;;; Process Infrastructure
+;;;; Require submodules (after sgn--log is defined)
 
-;;;###autoload
-(defun sgn-start ()
-  "Start the signal-cli JSON-RPC process."
-  (interactive)
-  (unless (executable-find sgn-cli-program)
-    (user-error "The signal-cli executable '%s' was not found. Please install it or check `sgn-cli-program'" sgn-cli-program))
+(require 'sgn-db)
+(require 'sgn-rpc)
+(require 'sgn-contacts)
+(require 'sgn-media)
+(require 'sgn-format)
+(require 'sgn-chat)
+(require 'sgn-actions)
+(require 'sgn-notify)
+(require 'sgn-search)
+(require 'sgn-dashboard)
 
-  (unless sgn-account
-    (user-error "Variable `sgn-account' is not set"))
+;;;; Utility
 
-  (when (get-process sgn--process-name)
-    (delete-process sgn--process-name))
+(defun sgn--ensure-list (value)
+  "Coerce VALUE to a list if it is a vector."
+  (if (vectorp value) (append value nil) value))
 
-  ;; State cleanup
-  (setq sgn--partial-line "")
-  (clrhash sgn--request-buffer-map)
-  (clrhash sgn--pending-callbacks)
+(defun sgn--is-group-id (id)
+  "Return non-nil if ID looks like a Signal group ID."
+  (not (or (string-prefix-p "+" id)
+           (string-match-p "-" id))))
 
-  (let ((proc (make-process
-               :name sgn--process-name
-               :buffer sgn--buffer-stderr
-               :command (list sgn-cli-program "-a" sgn-account "jsonRpc")
-               :filter #'sgn--process-filter
-               :sentinel #'sgn--process-sentinel
-               :coding 'utf-8-unix)))
-    (set-process-query-on-exit-flag proc nil)
-    (sgn--log "Sgn service started.")
-    (run-at-time sgn--contact-refresh-delay nil #'sgn-refresh-contacts)
-    (message "Sgn service started.")))
-
-(defun sgn-stop ()
-  "Stop the Sgn service."
-  (interactive)
-  (when (get-process sgn--process-name)
-    (delete-process sgn--process-name)
-    (message "Sgn service stopped.")))
-
-(defun sgn--send-rpc (method params &optional target-buffer callback)
-  "Send a JSON-RPC payload with METHOD and PARAMS.
-If TARGET-BUFFER is non-nil, map the request ID to that buffer for
-error handling.  If CALLBACK is non-nil, call it with the result
-when a successful response arrives."
-  (unless (get-process sgn--process-name)
-    (error "Sgn service not running. M-x sgn-start"))
-  (let* ((id (cl-incf sgn--rpc-id-counter))
-         (req `((jsonrpc . "2.0")
-                (method . ,method)
-                (params . ,params)
-                (id . ,id)))
-         (json-str (json-encode req)))
-    (when target-buffer
-      (puthash id (buffer-name target-buffer) sgn--request-buffer-map))
-    (when callback
-      (puthash id callback sgn--pending-callbacks))
-    (sgn--log "SEND: %s" json-str)
-    (process-send-string sgn--process-name (concat json-str "\n"))
-    id))
-
-;;; Parsing & Dispatch
-
-(defun sgn--process-filter (_proc string)
-  "Accumulate output from process and parse complete JSON objects from STRING."
-  (setq sgn--partial-line (concat sgn--partial-line string))
-  (when (> (length sgn--partial-line) sgn--max-partial-line-length)
-    (setq sgn--partial-line "")
-    (sgn--log "WARNING: Buffer overflow protection triggered. Dropped data."))
-
-  (let ((lines (split-string sgn--partial-line "\n")))
-    (if (string-suffix-p "\n" sgn--partial-line)
-        (setq sgn--partial-line "")
-      (setq sgn--partial-line (car (last lines)))
-      (setq lines (butlast lines)))
-
-    (dolist (line lines)
-      (setq line (string-trim line))
-      (when (and (not (string-empty-p line)) (string-prefix-p "{" line))
-        (sgn--log "RECV: %s" line)
-        (condition-case err
-            (let ((json (json-read-from-string line)))
-              (sgn--dispatch json))
-          (error (sgn--log "JSON Error: %s" err)))))))
-
-(defun sgn--process-sentinel (_proc event)
-  "Log process EVENT for debugging."
-  (sgn--log "Process Event: %s" event)
-  (when (string-prefix-p "exited" event)
-    (message "Sgn process exited.")))
-
-(defun sgn--dispatch (json)
-  "Dispatch JSON object to appropriate handler."
-  (let ((method (alist-get 'method json))
-        (error-obj (alist-get 'error json))
-        (id (alist-get 'id json))
-        (result (alist-get 'result json))
-        (params (alist-get 'params json)))
-    (cond
-     ((equal method "receive") (sgn--handle-receive params))
-     (error-obj (sgn--handle-error id error-obj))
-     ((and id result) (sgn--handle-result id result)))))
-
-(defun sgn--handle-error (id error-obj)
-  "Handle RPC errors for request ID using ERROR-OBJ."
-  (let* ((buf-name (gethash id sgn--request-buffer-map))
-         (msg (alist-get 'message error-obj)))
-    (sgn--log "RPC Error [%s]: %s" id msg)
-    (remhash id sgn--request-buffer-map)
-    (remhash id sgn--pending-callbacks)
-    (when (and buf-name (get-buffer buf-name))
-      (with-current-buffer buf-name
-        (sgn--insert-system-msg (format "ERROR: %s" msg) 'sgn-error-face)))))
-
-(defun sgn--handle-result (id result)
-  "Handle a successful RPC response for request ID with RESULT.
-Invokes and removes the pending callback, if any."
-  (let ((callback (gethash id sgn--pending-callbacks)))
-    (remhash id sgn--request-buffer-map)
-    (when callback
-      (remhash id sgn--pending-callbacks)
-      (funcall callback result))))
-
-(defun sgn--populate-contacts (result)
-  "Populate the contact map and active chats from a listContacts RESULT."
-  (let ((contacts (sgn--ensure-list result)))
-    (dolist (contact contacts)
-      (let ((number (alist-get 'number contact))
-            (name (alist-get 'name contact)))
-        (when (and number name (not (string-empty-p name)))
-          (puthash number name sgn--contact-map)
-          (puthash number t sgn--active-chats)))))
-  (sgn--dashboard-refresh))
-
-(defun sgn--populate-groups (result)
-  "Populate active chats from a listGroups RESULT."
-  (let ((groups (sgn--ensure-list result)))
-    (dolist (group groups)
-      (let ((group-id (alist-get 'id group))
-            (name (alist-get 'name group)))
-        (when group-id
-          (puthash group-id t sgn--active-chats)
-          (when (and name (not (string-empty-p name)))
-            (puthash group-id name sgn--contact-map))))))
-  (sgn--dashboard-refresh))
-
-(defun sgn-refresh-contacts ()
-  "Fetch contacts and groups from signal-cli and populate the dashboard."
-  (interactive)
-  (sgn--send-rpc "listContacts" nil nil #'sgn--populate-contacts)
-  (sgn--send-rpc "listGroups" nil nil #'sgn--populate-groups))
+;;;; Receive dispatch
 
 (defun sgn--handle-receive (params)
-  "Handle new messages, attachments, stickers, and sync events from PARAMS."
+  "Handle incoming messages from signal-cli.
+PARAMS is the parsed JSON params from the \"receive\" method."
   (let* ((envelope (alist-get 'envelope params))
-         (source (or (alist-get 'sourceNumber envelope) (alist-get 'source envelope)))
+         (source (or (alist-get 'sourceNumber envelope)
+                     (alist-get 'source envelope)))
          (source-name (alist-get 'sourceName envelope))
          (data (alist-get 'dataMessage envelope))
          (sync (alist-get 'syncMessage envelope))
          (typing (alist-get 'typingMessage envelope))
-         (group-info (alist-get 'groupInfo data)))
-
+         (receipt (alist-get 'receiptMessage envelope)))
+    ;; Update contact name cache
     (when (and source source-name)
-      (puthash source source-name sgn--contact-map))
-
-    (let ((chat-id (if group-info (alist-get 'groupId group-info) source)))
-      (when chat-id
-        (puthash chat-id t sgn--active-chats)
-        (sgn--dashboard-refresh)
-
-        ;; 1. Incoming Data (Text OR Attachments)
-        (when data
-          (let ((msg-text (alist-get 'message data))
-                (attachments (alist-get 'attachments data))
-                (sticker (alist-get 'sticker data))
-                (sender (or source-name source)))
-
-            (when (or msg-text attachments sticker)
-              (sgn--insert-msg chat-id sender msg-text attachments sticker nil)
-
-              ;; Notify
-              (let ((notify-body (cond (msg-text msg-text)
-                                       (sticker "[Sticker]")
-                                       (attachments "[Attachment]")
-                                       (t "New Message"))))
-                (notifications-notify :title (format "Sgn: %s" sender)
-                                      :body notify-body))
-
-              (when sgn-auto-open-buffer
-                (display-buffer (sgn--get-buffer chat-id))))))
-
-        ;; 2. Sync (My sent messages)
-        (when sync
-          (let* ((sent (alist-get 'sentMessage sync))
-                 (sync-group (alist-get 'groupInfo sent))
-                 (sync-id (or (and sync-group (alist-get 'groupId sync-group))
-                              (alist-get 'destinationNumber sent)))
-                 (msg-text (alist-get 'message sent))
-                 (attachments (alist-get 'attachments sent))
-                 (sticker (alist-get 'sticker sent)))
-            (when (and sync-id (or msg-text attachments sticker))
-              (puthash sync-id t sgn--active-chats)
-              (sgn--insert-msg sync-id "Me" msg-text attachments sticker t))))
-
-        ;; 3. Typing
-        (when (and typing (string= "STARTED" (alist-get 'action typing)))
-          (with-current-buffer (sgn--get-buffer chat-id)
-            (setq mode-line-process (format " [%s...]" (or source-name source)))))))))
-
-;;; Media & Stickers
-
-(defun sgn--find-sticker (pack-id sticker-id)
-  "Find the local sticker file for PACK-ID and STICKER-ID using manifest.json."
-  (let* ((base-dir (expand-file-name "stickers/" sgn-data-directory))
-         (pack-dir (expand-file-name pack-id base-dir))
-         (manifest-file (expand-file-name "manifest.json" pack-dir)))
-    (if (file-exists-p manifest-file)
-        ;; METHOD 1: Use manifest.json (Accurate)
-        (condition-case nil
-            (let* ((json-object-type 'alist)
-                   (json-array-type 'list)
-                   (manifest (json-read-file manifest-file))
-                   (stickers (alist-get 'stickers manifest))
-                   (sticker-info (seq-find (lambda (s) (= (alist-get 'id s) sticker-id)) stickers))
-                   (file-name (alist-get 'file sticker-info)))
-              (when file-name
-                (expand-file-name file-name pack-dir)))
-          (error nil))
-      ;; METHOD 2: Fallback (Guessing)
-      (let* ((path-no-ext (expand-file-name (number-to-string sticker-id) pack-dir))
-             (path-webp (concat path-no-ext ".webp")))
-        (cond
-         ((file-exists-p path-webp) path-webp)
-         ((file-exists-p path-no-ext) path-no-ext)
-         (t nil))))))
-
-(defun sgn--convert-apng-to-gif (file)
-  "Convert APNG FILE to a temporary GIF using ImageMagick `convert'.
-Returns the path to the temporary GIF."
-  (let ((tmp-gif (make-temp-file "sgn-sticker-" nil ".gif")))
-    (if (executable-find "convert")
-        (with-temp-buffer
-          ;; "apng:" forces APNG decoding; "-coalesce" merges frames
-          ;; into standalone images (required for correct GIF animation)
-          (if (eq 0 (call-process "convert" nil nil nil
-                                  (concat "apng:" file)
-                                  "-coalesce"
-                                  tmp-gif))
-              tmp-gif
-            (sgn--log "Failed to convert APNG to GIF. `convert' exit code non-zero.")
-            ;; Cleanup failed file if it was created
-            (when (file-exists-p tmp-gif) (delete-file tmp-gif))
-            nil))
-      (sgn--log "ImageMagick `convert' not found. Cannot animate APNG.")
-      (when (file-exists-p tmp-gif) (delete-file tmp-gif))
-      nil)))
-
-(defun sgn--insert-media (attachments sticker)
-  "Insert media for ATTACHMENTS and STICKER into the current buffer."
-  (when sticker
-    (sgn--insert-sticker sticker))
-  (when attachments
-    (let ((att-list (sgn--ensure-list attachments)))
-      (dolist (att att-list)
-        (sgn--insert-attachment att)))))
-
-(defun sgn--insert-sticker (sticker)
-  "Insert STICKER media into the current buffer."
-  (let* ((pack-id (alist-get 'packId sticker))
-         (sticker-id (alist-get 'stickerId sticker))
-         (emoji (or (alist-get 'emoji sticker) sgn--sticker-fallback-emoji))
-         (file (when (and pack-id sticker-id)
-                 (sgn--find-sticker pack-id sticker-id))))
-    (insert "\n")
+      (sgn-contacts-set-name source source-name))
+    ;; Dispatch by message type
     (cond
-     ((and file (file-exists-p file))
-      (sgn--insert-sticker-image file emoji))
-     (t
-      (insert (propertize (format "[Sticker %s]" emoji)
-                          'face 'font-lock-constant-face))))))
+     (data (sgn--handle-data-message envelope source data))
+     (sync (sgn--handle-sync-message envelope sync))
+     (typing (sgn--handle-typing envelope source typing))
+     (receipt (sgn--handle-receipt-message envelope source receipt)))))
 
-(defun sgn--insert-sticker-image (file emoji)
-  "Insert sticker image from FILE, with EMOJI as fallback label.
-Handles APNG-to-GIF conversion when ImageMagick is available."
-  (let* ((type (image-type-from-file-header file))
-         (final-file file)
-         (converted nil))
-    (when (and (eq type 'png) (executable-find "convert"))
-      (let ((gif (sgn--convert-apng-to-gif file)))
-        (when gif
-          (setq final-file gif)
-          (setq converted t))))
-    (let ((image (sgn--insert-inline-image final-file sgn--sticker-max-width)))
-      (when converted
-        (run-at-time sgn--temp-file-cleanup-delay nil
-                     (lambda (f) (when (file-exists-p f) (delete-file f)))
-                     final-file))
-      (unless image
-        (insert (propertize (format "[Sticker %s (Render Failed)]" emoji)
-                            'face 'font-lock-warning-face))))))
+;;;; Data message handling
 
-(defun sgn--insert-attachment (att)
-  "Insert a single attachment ATT into the current buffer."
-  (let* ((stored (alist-get 'storedFilename att))
-         (type (alist-get 'contentType att))
-         (name (or (alist-get 'filename att) "attachment"))
-         (att-id (alist-get 'id att))
-         (path (or (and stored (file-exists-p stored) stored)
-                   (let ((std (expand-file-name
-                               (format "attachments/%s" att-id)
-                               sgn-data-directory)))
-                     (and (file-exists-p std) std)))))
-    (insert "\n")
+(defun sgn--handle-data-message (envelope source data)
+  "Handle an incoming data message.
+ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
+  (let* ((group-info (alist-get 'groupInfo data))
+         (chat-id (if group-info (alist-get 'groupId group-info) source))
+         (timestamp (alist-get 'timestamp data))
+         (msg-text (alist-get 'message data))
+         (attachments (alist-get 'attachments data))
+         (sticker (alist-get 'sticker data))
+         (reaction (alist-get 'reaction data))
+         (remote-delete (alist-get 'remoteDelete data))
+         (edit-ts (alist-get 'editTimestamp data))
+         (quote-data (alist-get 'quote data))
+         (styles (alist-get 'textStyles data))
+         (mentions (alist-get 'mentions data))
+         (poll-data (alist-get 'poll data))
+         (pin-data (alist-get 'pinMessage data)))
+    ;; Ensure chat exists in DB
+    (sgn-db-upsert-chat chat-id
+                        :type (if group-info "group" "individual")
+                        :last-msg-ts timestamp)
     (cond
-     ((and path type (string-prefix-p "image/" type))
-      (sgn--insert-inline-image path))
-     (path
-      (insert-button (format "[File: %s]" name)
-                     'action (lambda (_) (browse-url-of-file path))
-                     'face 'link
-                     'help-echo (format "Type: %s\nPath: %s" type path)))
-     (t
-      (insert-button (format "[File: %s (Not Downloaded)]" name)
-                     'action (lambda (_)
-                               (message "File not found: attachments/%s" att-id))
-                     'face 'font-lock-comment-face)))))
+     ;; Reaction
+     (reaction
+      (sgn--handle-incoming-reaction chat-id source reaction))
+     ;; Remote delete
+     (remote-delete
+      (sgn--handle-incoming-delete chat-id remote-delete))
+     ;; Edit
+     (edit-ts
+      (sgn--handle-incoming-edit chat-id source data edit-ts))
+     ;; Poll
+     (poll-data
+      (sgn--handle-incoming-poll chat-id source timestamp poll-data envelope))
+     ;; Pin
+     (pin-data
+      (sgn--handle-incoming-pin chat-id source pin-data))
+     ;; Normal message (text, media, sticker)
+     ((or msg-text attachments sticker)
+      (sgn--handle-incoming-message
+       chat-id source timestamp msg-text attachments sticker
+       quote-data styles mentions envelope)))
+    ;; Update dashboard
+    (sgn-dashboard-refresh)
+    ;; Update unread & notifications
+    (sgn--update-unread-for-message chat-id source msg-text sticker attachments)))
 
-(defun sgn--insert-inline-image (path &optional max-width)
-  "Insert an inline image from PATH with optional MAX-WIDTH.
-MAX-WIDTH defaults to `sgn--image-max-width'.  Animate
-multi-frame images when `sgn-enable-animation' is non-nil.
-Return the image object, or nil if creation failed."
-  (let ((image (create-image path nil nil
-                             :max-width (or max-width sgn--image-max-width))))
-    (when image
-      (insert-image image)
-      (when (and sgn-enable-animation (fboundp 'image-animate)
-                 (image-multi-frame-p image))
-        (image-animate image nil t)))
-    image))
+(defun sgn--handle-incoming-message (chat-id sender timestamp body
+                                              attachments sticker
+                                              quote-data styles mentions
+                                              envelope)
+  "Persist and display an incoming message."
+  (let* ((quote-ts (and quote-data (alist-get 'id quote-data)))
+         (quote-author (and quote-data (alist-get 'author quote-data)))
+         (quote-body (and quote-data (alist-get 'text quote-data)))
+         (styles-json (when styles (json-encode styles)))
+         (raw-json (json-encode envelope))
+         (rowid (sgn-db-insert-message
+                 (list :chat-id chat-id
+                       :sender sender
+                       :timestamp timestamp
+                       :body body
+                       :type "data"
+                       :quote-ts quote-ts
+                       :quote-author quote-author
+                       :quote-body quote-body
+                       :styles-json styles-json
+                       :raw-json raw-json))))
+    ;; Store attachments
+    (when (and rowid attachments)
+      (dolist (att (sgn--ensure-list attachments))
+        (sgn-db-insert-media
+         (list :message-rowid rowid
+               :chat-id chat-id
+               :content-type (alist-get 'contentType att)
+               :file-path (or (alist-get 'storedFilename att)
+                              (let ((aid (alist-get 'id att)))
+                                (when aid
+                                  (expand-file-name
+                                   (format "attachments/%s" aid)
+                                   sgn-data-directory))))
+               :file-name (alist-get 'filename att)
+               :is-voice (if (alist-get 'voiceNote att) 1 0)
+               :width (alist-get 'width att)
+               :height (alist-get 'height att)))))
+    ;; Store sticker as media
+    (when (and rowid sticker)
+      (let* ((pack-id (alist-get 'packId sticker))
+             (sticker-id (alist-get 'stickerId sticker))
+             (file (when (and pack-id sticker-id)
+                     (sgn-media-find-sticker pack-id sticker-id))))
+        (sgn-db-insert-media
+         (list :message-rowid rowid
+               :chat-id chat-id
+               :content-type "image/png"
+               :file-path file
+               :is-sticker 1))))
+    ;; Render in chat buffer
+    (when rowid
+      (let ((msg (sgn-db-get-message-by-rowid rowid)))
+        (when msg
+          (sgn-chat-insert-message msg))))
+    ;; Auto-open buffer
+    (when (and sgn-auto-open-buffer body)
+      (display-buffer (sgn-chat-get-buffer chat-id)))))
 
-;;; Buffer & UI Management
+(defun sgn--handle-incoming-reaction (chat-id sender reaction)
+  "Handle an incoming REACTION in CHAT-ID from SENDER."
+  (let* ((emoji (alist-get 'emoji reaction))
+         (target-author (alist-get 'targetAuthor reaction))
+         (target-ts (alist-get 'targetTimestamp reaction))
+         (is-remove (alist-get 'isRemove reaction))
+         (msg (sgn-db-get-message chat-id target-author target-ts)))
+    (when msg
+      (let ((rowid (plist-get msg :rowid)))
+        (if is-remove
+            (sgn-db-remove-reaction chat-id target-author target-ts sender)
+          (sgn-db-upsert-reaction
+           (list :message-rowid rowid
+                 :chat-id chat-id
+                 :target-author target-author
+                 :target-timestamp target-ts
+                 :sender sender
+                 :emoji emoji
+                 :removed 0)))
+        ;; Re-render message
+        (when-let* ((buf (get-buffer
+                          (format "*Sgn: %s*"
+                                  (sgn-contacts-get-name chat-id)))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (sgn-chat-update-message rowid))))))))
 
-(defvar-local sgn--chat-id nil
-  "The Signal recipient ID associated with the current buffer.")
+(defun sgn--handle-incoming-delete (chat-id remote-delete)
+  "Handle a remote delete in CHAT-ID."
+  (let* ((target-ts (alist-get 'timestamp remote-delete))
+         ;; Find the message by timestamp in this chat
+         (msgs (sgn-db-get-messages chat-id 1000))
+         (msg (cl-find-if (lambda (m)
+                            (equal (plist-get m :timestamp) target-ts))
+                          msgs)))
+    (when msg
+      (let ((rowid (plist-get msg :rowid)))
+        (sgn-db-delete-message rowid)
+        (when-let* ((buf (get-buffer
+                          (format "*Sgn: %s*"
+                                  (sgn-contacts-get-name chat-id)))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (sgn-chat-update-message rowid))))))))
 
-(defvar-local sgn--input-marker nil
-  "Marker indicating the start of the editable input area.")
+(defun sgn--handle-incoming-edit (chat-id sender data edit-ts)
+  "Handle an incoming edit to a message at EDIT-TS in CHAT-ID from SENDER."
+  (let* ((new-body (alist-get 'message data))
+         (new-styles (alist-get 'textStyles data))
+         (styles-json (when new-styles (json-encode new-styles)))
+         ;; Find original message
+         (msg (sgn-db-get-message chat-id sender edit-ts)))
+    (when msg
+      (let ((rowid (plist-get msg :rowid))
+            (now-ms (truncate (* (float-time) 1000))))
+        (sgn-db-update-message rowid
+                               (list :body new-body
+                                     :edited-at now-ms
+                                     :styles-json styles-json))
+        (when-let* ((buf (get-buffer
+                          (format "*Sgn: %s*"
+                                  (sgn-contacts-get-name chat-id)))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (sgn-chat-update-message rowid))))))))
 
-(defun sgn--guard-cursor ()
-  "Ensure cursor stays in the editable prompt area."
-  (let ((limit (if sgn--input-marker (marker-position sgn--input-marker) (point-min))))
-    (when (< (point) limit)
-      (goto-char limit))))
+(defun sgn--handle-incoming-poll (chat-id sender timestamp poll-data envelope)
+  "Handle an incoming poll in CHAT-ID from SENDER."
+  (let* ((question (alist-get 'question poll-data))
+         (options (alist-get 'options poll-data))
+         (raw-json (json-encode envelope))
+         (rowid (sgn-db-insert-message
+                 (list :chat-id chat-id
+                       :sender sender
+                       :timestamp timestamp
+                       :body (format "📊 %s" question)
+                       :type "data"
+                       :raw-json raw-json))))
+    (when rowid
+      (sgn-db-upsert-poll
+       (list :message-rowid rowid
+             :chat-id chat-id
+             :poll-author sender
+             :poll-timestamp timestamp
+             :question question
+             :options-json (json-encode options))))))
 
-(define-derived-mode sgn-chat-mode fundamental-mode "Sgn"
-  "Major mode for Signal chats."
-  (setq-local paragraph-start (regexp-quote sgn-prompt))
-  (visual-line-mode 1)
+(defun sgn--handle-incoming-pin (chat-id sender pin-data)
+  "Handle a pin/unpin message in CHAT-ID from SENDER."
+  (let* ((target-author (alist-get 'targetAuthor pin-data))
+         (target-ts (alist-get 'targetTimestamp pin-data))
+         (is-unpin (alist-get 'isUnpin pin-data))
+         (msg (sgn-db-get-message chat-id target-author target-ts)))
+    (when msg
+      (let ((rowid (plist-get msg :rowid)))
+        (if is-unpin
+            (sgn-db-remove-pin chat-id target-author target-ts)
+          (let ((now-ms (truncate (* (float-time) 1000))))
+            (sgn-db-insert-pin
+             (list :message-rowid rowid
+                   :chat-id chat-id
+                   :target-author target-author
+                   :target-timestamp target-ts
+                   :pinned-by sender
+                   :pinned-at now-ms))))))))
 
-  ;; Setup Input Marker
-  (setq sgn--input-marker (make-marker))
+;;;; Sync message handling
 
-  (add-hook 'post-command-hook #'sgn--guard-cursor nil t)
-  (local-set-key (kbd "RET") #'sgn--send-input)
-  (local-set-key (kbd "C-c C-c") #'sgn--send-input)
-  (local-set-key (kbd "C-c C-a") #'sgn-attach-file))
+(defun sgn--handle-sync-message (envelope sync)
+  "Handle a sync message (our own sent messages).
+ENVELOPE is the full envelope, SYNC is the syncMessage."
+  (let* ((sent (alist-get 'sentMessage sync))
+         (sync-group (and sent (alist-get 'groupInfo sent)))
+         (chat-id (or (and sync-group (alist-get 'groupId sync-group))
+                      (and sent (alist-get 'destinationNumber sent))))
+         (msg-text (and sent (alist-get 'message sent)))
+         (timestamp (and sent (alist-get 'timestamp sent)))
+         (attachments (and sent (alist-get 'attachments sent)))
+         (sticker (and sent (alist-get 'sticker sent)))
+         (edit-ts (and sent (alist-get 'editTimestamp sent)))
+         (quote-data (and sent (alist-get 'quote sent)))
+         (styles (and sent (alist-get 'textStyles sent))))
+    (when (and chat-id (or msg-text attachments sticker))
+      ;; Ensure chat exists
+      (sgn-db-upsert-chat chat-id
+                          :type (if sync-group "group" "individual")
+                          :last-msg-ts timestamp)
+      (cond
+       ;; Edit sync
+       (edit-ts
+        (sgn--handle-incoming-edit chat-id sgn-account sent edit-ts))
+       ;; Normal sent message
+       (t
+        (sgn--handle-incoming-message
+         chat-id sgn-account timestamp msg-text attachments sticker
+         quote-data styles nil envelope)))
+      (sgn-dashboard-refresh))))
 
-(defun sgn--get-buffer (id)
-  "Get or create a chat buffer for ID."
-  (let* ((buf-name (format "*Sgn: %s*" id))
-         (buffer (get-buffer buf-name)))
-    (unless buffer
-      (setq buffer (get-buffer-create buf-name))
-      (with-current-buffer buffer
-        (sgn-chat-mode)
-        (setq sgn--chat-id id)
-        (sgn--draw-prompt)))
-    buffer))
+;;;; Typing message handling
 
-(defun sgn--draw-prompt ()
-  "Draw the input prompt and update the input marker."
-  (let ((inhibit-read-only t))
-    (goto-char (point-max))
-    (insert (propertize sgn-prompt
-                        'read-only t
-                        'face 'minibuffer-prompt
-                        'rear-nonsticky '(read-only face)
-                        'front-sticky '(read-only face)))
-    ;; Update the marker to the end of the prompt
-    (set-marker sgn--input-marker (point))))
+(defun sgn--handle-typing (envelope source typing)
+  "Handle a typing indicator from SOURCE."
+  (ignore envelope)
+  (let* ((action (alist-get 'action typing))
+         (group-info (alist-get 'groupId typing))
+         (chat-id (or group-info source)))
+    (when chat-id
+      (if (equal action "STARTED")
+          (sgn-chat-show-typing chat-id source)
+        ;; STOPPED
+        (when-let* ((buf (get-buffer
+                          (format "*Sgn: %s*"
+                                  (sgn-contacts-get-name chat-id)))))
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (sgn-chat-clear-typing))))))))
 
-(defun sgn--insert-msg (id name text attachments sticker is-me)
-  "Insert text and media into the buffer for chat ID.
-NAME is the sender, TEXT is the content, ATTACHMENTS and STICKER contain
-media data, and IS-ME is non-nil if the message is from the user."
-  (with-current-buffer (sgn--get-buffer id)
-    (let ((inhibit-read-only t)
-          (name-face (if is-me 'sgn-my-msg-face 'sgn-other-msg-face)))
-      (save-excursion
-        ;; Move to just before the prompt
-        (goto-char (marker-position sgn--input-marker))
-        (forward-line 0) ;; Ensure we are at start of prompt line (usually empty above)
+;;;; Receipt handling
 
-        ;; If the previous line isn't a newline, insert one
-        (unless (bolp) (insert "\n"))
+(defun sgn--handle-receipt-message (envelope source receipt)
+  "Handle a receipt message from SOURCE."
+  (ignore envelope)
+  (let* ((type-str (alist-get 'type receipt))
+         (timestamps (sgn--ensure-list (alist-get 'timestamps receipt)))
+         (when-ts (alist-get 'when receipt)))
+    (dolist (ts timestamps)
+      ;; Find the message and store the receipt
+      (let ((msgs (sgn-db-get-messages source 500)))
+        (when-let* ((msg (cl-find-if
+                          (lambda (m) (equal (plist-get m :timestamp) ts))
+                          msgs)))
+          (sgn-db-upsert-receipt
+           (list :message-rowid (plist-get msg :rowid)
+                 :chat-id (plist-get msg :chat-id)
+                 :target-author sgn-account
+                 :target-timestamp ts
+                 :recipient source
+                 :type (or type-str "delivered")
+                 :received-at (or when-ts
+                                  (truncate (* (float-time) 1000))))))))))
 
-        ;; Delete the prompt from the view momentarily (optional, but cleaner)
-        (delete-region (point) (point-max))
+;;;; Unread tracking
 
-        ;; Insert Message
-        (insert (propertize (format-time-string "[%H:%M] ") 'face 'sgn-timestamp-face))
-        (insert (propertize (concat "<" name "> ") 'face name-face))
-        (when text (insert text))
-        (when (or attachments sticker)
-          (when text (insert "\n"))
-          (sgn--insert-media attachments sticker))
-        (insert "\n")
+(defun sgn--update-unread-for-message (chat-id source body sticker attachments)
+  "Update unread count and send notification for an incoming message."
+  ;; Only increment for messages from others
+  (when (and source (not (equal source sgn-account)))
+    ;; Check if chat buffer is focused
+    (let* ((buf (get-buffer (format "*Sgn: %s*"
+                                    (sgn-contacts-get-name chat-id))))
+           (focused (and buf
+                         (get-buffer-window buf)
+                         (eq buf (window-buffer (selected-window)))
+                         (frame-focus-state))))
+      (unless focused
+        (sgn-db-increment-unread chat-id)
+        ;; Send notification
+        (let ((notify-body (cond
+                            (body body)
+                            (sticker "[Sticker]")
+                            (attachments "[Attachment]")
+                            (t "New message"))))
+          (sgn-notify-message chat-id source notify-body))
+        (sgn-notify-update)))))
 
-        ;; Redraw Prompt at the new bottom
-        (sgn--draw-prompt)))
+;;;; Expiration timer
 
-    (let ((win (get-buffer-window (current-buffer))))
-      (when win (set-window-point win (point-max))))))
+(defvar sgn--expiration-timer nil
+  "Timer for periodic message expiration cleanup.")
 
-(defun sgn--insert-system-msg (text face)
-  "Insert a system message with TEXT using FACE."
-  (let ((inhibit-read-only t))
-    (save-excursion
-      (goto-char (if sgn--input-marker (marker-position sgn--input-marker) (point-max)))
-      (forward-line 0)
-      (delete-region (point) (point-max))
-      (insert (propertize (concat "*** " text "\n") 'face face))
-      (sgn--draw-prompt))))
+(defun sgn--start-expiration-timer ()
+  "Start the periodic expiration cleanup timer."
+  (sgn--stop-expiration-timer)
+  (setq sgn--expiration-timer
+        (run-at-time 60 60 #'sgn-db-purge-expired)))
 
-;;; Interactive Commands
+(defun sgn--stop-expiration-timer ()
+  "Stop the expiration timer."
+  (when sgn--expiration-timer
+    (cancel-timer sgn--expiration-timer)
+    (setq sgn--expiration-timer nil)))
 
-(defun sgn--is-group-id (id)
-  "Return non-nil if ID looks like a Signal group ID.
-Uses a heuristic: phone numbers start with \"+\" and UUIDs
-contain \"-\"; anything else is assumed to be a base64 group ID."
-  (not (or (string-prefix-p "+" id)
-           (string-match-p "-" id))))
+;;;; Top-level commands
 
-(defun sgn--send-input ()
-  "Send the input from the prompt to the current chat."
+;;;###autoload
+(defun sgn-start ()
+  "Start the sgn Signal client.
+Initializes the database, starts the signal-cli JSON-RPC process,
+refreshes contacts, and opens the dashboard."
   (interactive)
-  (let* ((start (marker-position sgn--input-marker))
-         (end (point-max))
-         (text (string-trim (buffer-substring-no-properties start end))))
-    (unless (string-empty-p text)
-      (let ((inhibit-read-only t))
-        (delete-region start end))
+  ;; Validate requirements
+  (unless (sqlite-available-p)
+    (user-error "Emacs was not compiled with SQLite support (required for sgn)"))
+  (unless sgn-account
+    (user-error "Variable `sgn-account' is not set"))
+  (unless (executable-find sgn-cli-program)
+    (user-error "signal-cli not found: %s" sgn-cli-program))
+  ;; Initialize database
+  (sgn-db-init)
+  ;; Load contacts from DB into cache
+  (sgn-contacts-load-from-db)
+  ;; Set up receive handler
+  (setq sgn-rpc-receive-handler #'sgn--handle-receive)
+  ;; Start RPC process
+  (sgn-rpc-start)
+  ;; Start periodic refresh
+  (sgn-contacts-start-refresh-timer)
+  ;; Start expiration cleanup
+  (sgn--start-expiration-timer)
+  ;; Subscribe to receive messages
+  (run-at-time 1 nil #'sgn-rpc-subscribe-receive)
+  ;; Refresh contacts from signal-cli
+  (run-at-time 2 nil #'sgn-contacts-refresh)
+  ;; Enable global indicator
+  (sgn-global-mode 1)
+  (message "Sgn started."))
 
-      (sgn--send-rpc "send"
-                     (sgn--build-send-params sgn--chat-id `((message . ,text)))
-                     (current-buffer))
+;;;###autoload
+(defun sgn-stop ()
+  "Stop the sgn Signal client."
+  (interactive)
+  (sgn-rpc-stop)
+  (sgn-contacts-stop-refresh-timer)
+  (sgn--stop-expiration-timer)
+  (sgn-db-close)
+  (sgn-global-mode -1)
+  (message "Sgn stopped."))
 
-      (sgn--insert-msg sgn--chat-id "Me" text nil nil t))))
+;;;###autoload
+(defun sgn-chat (recipient)
+  "Open a chat with RECIPIENT.
+When called interactively, prompts with completing-read over all
+contacts and groups, sorted by recency."
+  (interactive (list (sgn-contacts-completing-read)))
+  (sgn-chat-open recipient))
 
 ;;;###autoload
 (defun sgn-attach-file (file-path)
   "Send FILE-PATH as an attachment to the current chat."
   (interactive "fAttachment: ")
-  (unless sgn--chat-id
+  (unless sgn-chat-id
     (user-error "Not in a Signal chat buffer"))
   (let ((full-path (expand-file-name file-path)))
-    (sgn--send-rpc "send"
-                   (sgn--build-send-params sgn--chat-id
-                                           `((attachments . [,full-path])))
-                   (current-buffer))
-    (sgn--insert-msg sgn--chat-id "Me"
-                     (format "[Sending: %s]" (file-name-nondirectory full-path))
-                     nil nil t)))
-
-(defun sgn--build-send-params (chat-id base-params)
-  "Add recipient or group addressing to BASE-PARAMS for CHAT-ID."
-  (if (sgn--is-group-id chat-id)
-      (cons `(groupId . ,chat-id) base-params)
-    (cons `(recipient . [,chat-id]) base-params)))
+    (sgn-rpc-send-message sgn-chat-id nil
+                          `((attachments . [,full-path])))))
 
 ;;;###autoload
-(defun sgn-chat (recipient)
-  "Open a chat buffer for RECIPIENT (phone number or group ID)."
-  (interactive "sSignal Recipient (+Phone): ")
-  (let ((buffer (sgn--get-buffer recipient)))
-    (switch-to-buffer buffer)
-    (message "Chat opened.")))
-
-;;; Dashboard
-
-(defvar sgn-dashboard-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
-    (define-key map (kbd "RET") #'sgn--dashboard-open-entry)
-    (define-key map (kbd "n") #'forward-button)
-    (define-key map (kbd "p") #'backward-button)
-    (define-key map (kbd "g") #'sgn--dashboard-refresh)
-    map)
-  "Keymap for `sgn-dashboard-mode'.")
-
-(define-derived-mode sgn-dashboard-mode special-mode "Sgn List"
-  "Major mode for the list of active Signal chats.")
-
-(defun sgn--dashboard-draw ()
-  "Redraw the dashboard content."
-  (let ((inhibit-read-only t))
-    (erase-buffer)
-    (insert "Active Chats:\n")
-    (insert "-------------\n")
-    (maphash (lambda (id _)
-               (let ((name (gethash id sgn--contact-map id)))
-                 (insert-button (format "%s (%s)" name id)
-                                'action #'sgn--dashboard-open-entry
-                                'sgn-id id
-                                'follow-link t)
-                 (insert "\n")))
-             sgn--active-chats)))
-
-(defun sgn--dashboard-refresh ()
-  "Refresh the dashboard buffer."
+(defun sgn-send-voice-note ()
+  "Record and send a voice note to the current chat."
   (interactive)
-  (let ((buf (get-buffer "*Sgn List*")))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((line (line-number-at-pos)))
-          (sgn--dashboard-draw)
-          (goto-char (point-min))
-          (forward-line (1- line)))))))
+  (unless sgn-chat-id
+    (user-error "Not in a Signal chat buffer"))
+  ;; TODO: implement recording via sox
+  (user-error "Voice note recording is not yet implemented"))
 
 ;;;###autoload
-(defun sgn-dashboard ()
-  "Open the Sgn Dashboard."
+(defun sgn-note-to-self ()
+  "Open the Note to Self chat."
   (interactive)
-  (let ((buf (get-buffer-create "*Sgn List*")))
-    (with-current-buffer buf
-      (sgn-dashboard-mode)
-      (sgn--dashboard-draw))
-    (switch-to-buffer buf)))
+  (unless sgn-account
+    (user-error "Variable `sgn-account' is not set"))
+  (sgn-chat-open sgn-account))
 
-(defun sgn--dashboard-open-entry (&optional btn)
-  "Open chat for the button at point or BTN."
-  (interactive)
-  (let* ((button (or btn (button-at (point))))
-         (id (and button (button-get button 'sgn-id))))
-    (if id
-        (sgn-chat id)
-      (user-error "No chat entry at point"))))
+;;;; Group management
+
+;;;###autoload
+(defun sgn-create-group (name members)
+  "Create a new Signal group with NAME and MEMBERS.
+MEMBERS is a list of phone numbers."
+  (interactive
+   (let* ((name (read-string "Group name: "))
+          (members nil)
+          (member ""))
+     (while (progn
+              (setq member (read-string
+                            (format "Member %d (+phone, empty to finish): "
+                                    (1+ (length members)))))
+              (not (string-empty-p member)))
+       (push member members))
+     (list name (nreverse members))))
+  (sgn-rpc-send "updateGroup"
+                `((name . ,name)
+                  (member . ,(vconcat members)))
+                (lambda (result)
+                  (sgn--log "Group created: %s" result)
+                  (sgn-contacts-refresh)
+                  (message "Group \"%s\" created." name))))
+
+;;;###autoload
+(defun sgn-set-disappearing (seconds)
+  "Set the disappearing message timer for the current chat.
+SECONDS is the timer duration; 0 to disable."
+  (interactive "nDisappearing timer (seconds, 0=off): ")
+  (unless sgn-chat-id
+    (user-error "Not in a Signal chat buffer"))
+  (if (sgn--is-group-id sgn-chat-id)
+      (sgn-rpc-send "updateGroup"
+                    `((groupId . ,sgn-chat-id)
+                      (expiration . ,seconds)))
+    (sgn-rpc-send "updateContact"
+                  `((recipient . ,sgn-chat-id)
+                    (expiration . ,seconds))))
+  (sgn-db-upsert-chat sgn-chat-id :expiration seconds)
+  (message "Disappearing messages: %s"
+           (if (zerop seconds) "off"
+             (sgn-chat--format-duration seconds))))
+
+(declare-function sgn-chat--format-duration "sgn-chat")
+
+;;;###autoload
+(defun sgn-block-contact (contact)
+  "Block CONTACT."
+  (interactive (list (sgn-contacts-completing-read "Block: ")))
+  (when (y-or-n-p (format "Block %s? " (sgn-contacts-get-name contact)))
+    (sgn-rpc-send "block" `((recipient . [,contact])))
+    (message "Blocked %s." (sgn-contacts-get-name contact))))
+
+;;;###autoload
+(defun sgn-unblock-contact (contact)
+  "Unblock CONTACT."
+  (interactive (list (sgn-contacts-completing-read "Unblock: ")))
+  (sgn-rpc-send "unblock" `((recipient . [,contact])))
+  (message "Unblocked %s." (sgn-contacts-get-name contact)))
 
 (provide 'sgn)
 ;;; sgn.el ends here

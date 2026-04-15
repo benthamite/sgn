@@ -1,0 +1,481 @@
+#+title: sgn: Signal client for Emacs
+#+author: Pablo Stafforini
+#+email: pablo@stafforini.com
+#+language: en
+#+options: ':t toc:t author:t email:t num:t
+#+startup: content
+#+export_file_name: sgn.info
+#+texinfo_filename: sgn.info
+#+texinfo_dir_category: Emacs misc features
+#+texinfo_dir_title: sgn: (sgn)
+#+texinfo_dir_desc: Signal client for Emacs
+
+This manual describes the features and customization options for the Emacs Lisp package =sgn=.
+
+* Overview
+:PROPERTIES:
+:CUSTOM_ID: h:overview
+:END:
+
+=sgn= is a full-featured Signal messenger client for Emacs, designed to replace Signal Desktop for daily use.  It communicates with a running =signal-cli= daemon via JSON-RPC and persists all message history locally in an SQLite database with full-text search.
+
+The user experience is modeled after =telega=, the Telegram client for Emacs.  Chat buffers use a header-plus-body grouping style, with text properties on every message enabling point-based commands for reactions, replies, editing, deletion, and more.  A dashboard buffer provides a chat list with unread badges, last-message previews, and pinned chats.
+
+The package is split into focused modules:
+
+- =sgn.el= --- Entry point, autoloads, and top-level commands.
+- =sgn-rpc.el= --- JSON-RPC subprocess management, send/receive, retry logic.
+- =sgn-db.el= --- SQLite persistence layer with FTS5 full-text search.
+- =sgn-chat.el= --- Chat buffer mode with telega-style rendering and input handling.
+- =sgn-actions.el= --- Message actions: react, reply, edit, delete, forward, pin.
+- =sgn-contacts.el= --- Contact/group cache and completing-read interface.
+- =sgn-media.el= --- Inline images, stickers, voice notes, link previews.
+- =sgn-format.el= --- Text formatting: render Signal styles, compose markup.
+- =sgn-notify.el= --- Modeline/tab-bar unread indicator and desktop notifications.
+- =sgn-search.el= --- FTS5-powered search across conversations.
+- =sgn-dashboard.el= --- Chat list buffer with sorting, unread tracking, and fade-out truncation.
+- =sgn-import.el= --- One-time import of history from Signal Desktop.
+
+*Prerequisites*:
+
+1. Emacs 29.1 or later, compiled with SQLite and FTS5 support.
+2. =signal-cli= v0.14+ installed and in ~$PATH~, with a registered or linked Signal account.
+3. Optional: ImageMagick (=convert=) for animated sticker conversion; =sox= for voice note recording; =sqlcipher= CLI for Signal Desktop import.
+
+The package has no external Emacs package dependencies --- it uses only built-in libraries.
+
+* User options
+:PROPERTIES:
+:CUSTOM_ID: h:user-options
+:END:
+
+** Account and program paths
+:PROPERTIES:
+:CUSTOM_ID: h:account-and-program-paths
+:END:
+
+#+vindex: sgn-account
+#+vindex: sgn-cli-program
+#+vindex: sgn-data-directory
+#+vindex: sgn-db-directory
+The user option ~sgn-account~ specifies the registered Signal phone number, for example =+15550000000=.  This must match the account registered with =signal-cli=.  The value is required: ~sgn-start~ will signal an error if it is ~nil~.  The default is ~nil~.
+
+The user option ~sgn-cli-program~ specifies the path to the =signal-cli= executable.  If =signal-cli= is on your ~$PATH~, the default value (the result of ~executable-find~) should work without modification.
+
+The user option ~sgn-data-directory~ specifies the directory where =signal-cli= stores its data, including attachments and sticker packs.  The default is =~/.local/share/signal-cli=.  You would change this if you installed =signal-cli= with a non-standard data path.
+
+The user option ~sgn-db-directory~ specifies the directory where =sgn= stores its SQLite database.  The default is =~/.local/share/sgn=.  The directory is created automatically on first run.
+
+** Message display
+:PROPERTIES:
+:CUSTOM_ID: h:message-display
+:END:
+
+#+vindex: sgn-history-page-size
+#+vindex: sgn-message-grouping-interval
+#+vindex: sgn-timestamp-format
+#+vindex: sgn-prompt
+The user option ~sgn-history-page-size~ controls how many messages are loaded into a chat buffer when it is first opened.  The default is 50.  Increase this if you want to see more history immediately; decrease it for faster buffer creation.
+
+The user option ~sgn-message-grouping-interval~ specifies the number of seconds within which consecutive messages from the same sender are grouped under a single header.  The default is 300 (five minutes).  Set this to 0 to disable grouping entirely, or increase it to group messages over longer spans.
+
+The user option ~sgn-timestamp-format~ controls how message timestamps are displayed.  It accepts three values: ~smart~ (the default) shows relative time for recent messages and absolute time for older ones; ~absolute~ always shows the full date and time; ~relative~ always shows relative time (e.g., "5m", "2h").
+
+The user option ~sgn-prompt~ specifies the input prompt string displayed at the bottom of chat buffers.  The default is ="> "=.
+
+** Media rendering
+:PROPERTIES:
+:CUSTOM_ID: h:media-rendering
+:END:
+
+#+vindex: sgn-image-max-width
+#+vindex: sgn-sticker-max-width
+#+vindex: sgn-enable-animation
+The user option ~sgn-image-max-width~ sets the maximum pixel width for inline image rendering in chat buffers.  The default is 300.  Increase this on high-resolution displays or if you want larger image previews.
+
+The user option ~sgn-sticker-max-width~ sets the maximum pixel width for sticker images.  The default is 150.  Stickers are typically smaller than photos, so a separate limit keeps them from appearing disproportionately large.
+
+The user option ~sgn-enable-animation~ controls whether stickers and GIFs are animated.  The default is ~t~.  Set this to ~nil~ if animations are distracting or cause performance issues.
+
+** Messaging behavior
+:PROPERTIES:
+:CUSTOM_ID: h:messaging-behavior
+:END:
+
+#+vindex: sgn-auto-open-buffer
+#+vindex: sgn-send-read-receipts
+#+vindex: sgn-cli-auto-read-receipts
+#+vindex: sgn-send-typing
+The user option ~sgn-auto-open-buffer~ controls whether a chat buffer is automatically displayed when an incoming message arrives.  The default is ~nil~, meaning new messages only update the unread count and trigger notifications.  Set this to ~t~ if you want Emacs to switch to the relevant chat buffer on each incoming message.
+
+The user option ~sgn-send-read-receipts~ controls whether =sgn= sends read receipts via ~sendReceipt~ when a chat buffer is visible and focused.  The default is ~t~.  This is /focus-gated/: receipts are only sent when you are actually looking at the chat, preserving your privacy when you have a chat buffer open but unfocused.
+
+The user option ~sgn-cli-auto-read-receipts~ controls whether the =--send-read-receipts= flag is passed to =signal-cli= at the process level.  The default is ~nil~.  When enabled, =signal-cli= sends read receipts for /every/ incoming data message regardless of Emacs focus.  Most users should leave this off and rely on ~sgn-send-read-receipts~ instead.
+
+The user option ~sgn-send-typing~ controls whether typing indicators are sent to your chat partner while you compose a message.  The default is ~t~.
+
+** Notifications
+:PROPERTIES:
+:CUSTOM_ID: h:notifications
+:END:
+
+#+vindex: sgn-notification-style
+#+vindex: sgn-desktop-notifications
+The user option ~sgn-notification-style~ determines where the global unread count indicator is displayed.  It accepts two values: ~modeline~ (the default) adds a =[sgn:N]= indicator to the global mode line; ~tab-bar~ adds a segment to the tab bar instead.  The indicator is managed by the minor mode ~sgn-global-mode~ ([[#h:global-indicator][Global indicator]]).
+
+The user option ~sgn-desktop-notifications~ controls whether desktop notifications are shown for incoming messages.  The default is ~t~.  Notifications are suppressed for muted chats.  On macOS, notifications use AppleScript; on Linux, they use D-Bus via ~notifications-notify~.
+
+* Commands
+:PROPERTIES:
+:CUSTOM_ID: h:commands
+:END:
+
+** Starting and stopping
+:PROPERTIES:
+:CUSTOM_ID: h:starting-and-stopping
+:END:
+
+#+findex: sgn-start
+#+findex: sgn-stop
+#+findex: sgn-show-log
+The command ~sgn-start~ initializes the =sgn= Signal client.  It validates that SQLite and =signal-cli= are available, initializes the database, loads the contact cache, starts the JSON-RPC subprocess, subscribes to incoming messages, refreshes contacts, and enables the global unread indicator.  Call this once at the beginning of your session.
+
+The command ~sgn-stop~ shuts down the client.  It stops the JSON-RPC subprocess, cancels all timers (contact refresh, message expiration), closes the database, and disables the global indicator.
+
+The command ~sgn-show-log~ displays the =*sgn-log*= debug buffer.  This buffer records all JSON-RPC traffic and internal events, which is useful for troubleshooting connectivity or message delivery issues.
+
+** Opening chats
+:PROPERTIES:
+:CUSTOM_ID: h:opening-chats
+:END:
+
+#+findex: sgn-chat
+#+findex: sgn-note-to-self
+#+findex: sgn-dashboard
+The command ~sgn-chat~ prompts for a recipient using ~completing-read~ over all contacts and groups, sorted by recency.  Each candidate carries a hidden stable chat ID, so selection works correctly even when multiple contacts share a display name.  Annotations show unread counts and relative timestamps.
+
+The command ~sgn-note-to-self~ opens the "Note to Self" chat, which is the conversation with your own Signal account.
+
+The command ~sgn-dashboard~ opens the chat list buffer ([[#h:dashboard][Dashboard]]).
+
+** Sending messages and media
+:PROPERTIES:
+:CUSTOM_ID: h:sending-messages-and-media
+:END:
+
+#+findex: sgn-chat-send-input
+#+findex: sgn-attach-file
+#+findex: sgn-send-voice-note
+The command ~sgn-chat-send-input~ sends the text in the input area to the current chat.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (=*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, =||spoiler||=) is parsed into Signal style ranges before sending.  Bound to ~RET~ in chat buffers.
+
+The command ~sgn-attach-file~ sends a file as an attachment to the current chat.  It prompts for a file path interactively.  Bound to ~C-c C-a~.
+
+The command ~sgn-send-voice-note~ is a placeholder for recording and sending voice notes.  It is not yet implemented.
+
+** Message actions
+:PROPERTIES:
+:CUSTOM_ID: h:message-actions
+:END:
+
+These commands operate on the message at point in a chat buffer.  Point can be anywhere within a message's text property region.
+
+#+findex: sgn-react
+#+findex: sgn-reply
+#+findex: sgn-edit
+#+findex: sgn-delete
+#+findex: sgn-forward
+#+findex: sgn-copy-text
+#+findex: sgn-toggle-pin
+#+findex: sgn-chat-cancel-action
+The command ~sgn-react~ sends a reaction to the message at point.  It prompts with ~completing-read~ over common emoji (by name, e.g., "thumbs up", "heart").  You can also type an emoji character directly.  If you have already reacted to the message, invoking ~sgn-react~ again removes your reaction.  Bound to ~r~.
+
+The command ~sgn-reply~ sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press ~C-g~ (~sgn-chat-cancel-action~) to cancel.  Bound to ~q~.
+
+The command ~sgn-edit~ places the text of your own message at point into the input area for editing.  Only your own messages can be edited.  The edited text is sent with ~editTimestamp~ so Signal replaces the original.  Press ~C-g~ to cancel.  Bound to ~e~.
+
+The command ~sgn-delete~ performs a remote delete of your own message at point.  It prompts for confirmation with ~y-or-n-p~.  The message is marked as deleted both locally and for all recipients.  Bound to ~d~.
+
+The command ~sgn-forward~ sends the text of the message at point to another chat selected via ~completing-read~.  Bound to ~f~.
+
+The command ~sgn-copy-text~ copies the message text at point to the kill ring.  Bound to ~c~.
+
+The command ~sgn-toggle-pin~ pins or unpins the message at point.  If the message is already pinned, it is unpinned; otherwise, it is pinned.  Pinned messages display a pin indicator in the chat buffer.  Bound to ~P~.
+
+The command ~sgn-chat-cancel-action~ cancels an in-progress reply or edit, clearing the input area and restoring the normal prompt.  If no action is in progress, it falls through to ~keyboard-quit~.  Bound to ~C-g~.
+
+** Polls
+:PROPERTIES:
+:CUSTOM_ID: h:polls
+:END:
+
+#+findex: sgn-create-poll
+#+findex: sgn-vote-poll
+The command ~sgn-create-poll~ creates a new poll in the current chat.  It prompts for a question and then repeatedly prompts for options until you enter an empty string.  At least two options are required.
+
+The command ~sgn-vote-poll~ votes in the poll at point.  It displays the available options via ~completing-read~ and sends the vote to the group.
+
+** Searching
+:PROPERTIES:
+:CUSTOM_ID: h:searching
+:END:
+
+#+findex: sgn-search
+#+findex: sgn-search-in-chat
+#+findex: sgn-search-refresh
+#+findex: sgn-search-goto-result
+#+findex: sgn-search-next-result
+#+findex: sgn-search-prev-result
+The command ~sgn-search~ performs a full-text search across all conversations using FTS5.  It prompts for a query string and displays results in a =*sgn Search*= buffer.  Each result shows the sender, timestamp, a snippet with highlighted matches, and a link to the source chat.  Deleted messages are excluded.
+
+The command ~sgn-search-in-chat~ restricts the search to the current chat buffer.
+
+The command ~sgn-search-refresh~ re-runs the most recent search query.
+
+In the search results buffer, ~sgn-search-goto-result~ (bound to ~RET~) opens the chat containing the result at point.  ~sgn-search-next-result~ (~n~) and ~sgn-search-prev-result~ (~p~) navigate between results.
+
+** Dashboard
+:PROPERTIES:
+:CUSTOM_ID: h:dashboard
+:END:
+
+#+findex: sgn-dashboard
+#+findex: sgn-dashboard-refresh
+#+findex: sgn-dashboard-open
+#+findex: sgn-dashboard-mark-read
+#+findex: sgn-dashboard-toggle-mute
+#+findex: sgn-dashboard-toggle-pin
+The dashboard is a ~tabulated-list-mode~ buffer named =*sgn*= that displays all conversations sorted by last message timestamp, with pinned chats always at the top.  Each row shows the chat name, a last-message preview, a relative timestamp, and an unread count.  Chats with unread messages are displayed in bold.  Long text is truncated with a fade-out gradient effect instead of an ellipsis.
+
+The command ~sgn-dashboard-open~ opens the chat at point.  Bound to ~RET~.
+
+The command ~sgn-dashboard-mark-read~ marks the chat at point as read and resets its unread count.  Bound to ~d~.
+
+The command ~sgn-dashboard-toggle-mute~ mutes or unmutes the chat at point.  Muted chats suppress desktop notifications.  Bound to ~M~.
+
+The command ~sgn-dashboard-toggle-pin~ pins or unpins the chat at point.  Pinned chats are sorted to the top of the list.  Bound to ~P~.
+
+The command ~sgn-dashboard-refresh~ reloads the dashboard data from the database.  Bound to ~g~.  The dashboard also refreshes automatically when new messages arrive.
+
+** Group and contact management
+:PROPERTIES:
+:CUSTOM_ID: h:group-and-contact-management
+:END:
+
+#+findex: sgn-create-group
+#+findex: sgn-set-disappearing
+#+findex: sgn-block-contact
+#+findex: sgn-unblock-contact
+#+findex: sgn-contacts-refresh
+The command ~sgn-create-group~ creates a new Signal group.  It prompts for a group name and then repeatedly prompts for member phone numbers until you enter an empty string.
+
+The command ~sgn-set-disappearing~ sets the disappearing message timer for the current chat.  It prompts for a duration in seconds; entering 0 disables the timer.  The command dispatches to ~updateGroup~ for groups and ~updateContact~ for individual chats.
+
+The command ~sgn-block-contact~ blocks a contact after confirmation.  The command ~sgn-unblock-contact~ unblocks a previously blocked contact.  Both prompt for the contact via ~completing-read~.
+
+The command ~sgn-contacts-refresh~ fetches the latest contacts and groups from =signal-cli= and updates both the in-memory cache and the database.  This runs automatically on startup and periodically, but you can invoke it manually if a contact name has not yet updated.
+
+** Global indicator
+:PROPERTIES:
+:CUSTOM_ID: h:global-indicator
+:END:
+
+#+findex: sgn-global-mode
+The minor mode ~sgn-global-mode~ activates the global unread count indicator.  When enabled, it displays the total unread message count in either the mode line or tab bar, depending on the value of ~sgn-notification-style~ ([[#h:notifications][Notifications]]).  This mode is enabled automatically by ~sgn-start~ and disabled by ~sgn-stop~.
+
+** Text formatting
+:PROPERTIES:
+:CUSTOM_ID: h:text-formatting
+:END:
+
+#+findex: sgn-format-reveal-spoiler-at-point
+The command ~sgn-format-reveal-spoiler-at-point~ reveals spoiler text at point.  Spoiler messages arrive with foreground and background colors matched so the text is concealed; this command swaps the face to ~sgn-spoiler-revealed-face~ to make the text readable.
+
+** Importing from Signal Desktop
+:PROPERTIES:
+:CUSTOM_ID: h:importing-from-signal-desktop
+:END:
+
+#+findex: sgn-import-from-desktop
+The command ~sgn-import-from-desktop~ performs a one-time import of message history from Signal Desktop's SQLCipher database into =sgn='s SQLite database.  This requires the =sqlcipher= CLI tool (installable via =brew install sqlcipher= on macOS) and a local Signal Desktop installation.
+
+The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file, builds conversation and identity mappings, imports all messages with their metadata (quotes, expiration timers, raw JSON), and then imports reactions.  The temporary file is deleted after the import completes.
+
+On macOS, the command automatically handles both the legacy plain-text key and the newer Chromium safeStorage encrypted key format, decrypting via the macOS Keychain and Node.js.
+
+** Miscellaneous
+:PROPERTIES:
+:CUSTOM_ID: h:miscellaneous-commands
+:END:
+
+#+findex: sgn-open-at-point
+#+findex: sgn-load-more-history
+The command ~sgn-open-at-point~ opens media or follows a link at point.  If point is on a button (such as an attachment or link preview), it activates it.  Bound to ~RET~ in the message area.
+
+The command ~sgn-load-more-history~ loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to ~g~ in chat buffers.
+
+* Functions
+:PROPERTIES:
+:CUSTOM_ID: h:functions
+:END:
+
+** Contact resolution
+:PROPERTIES:
+:CUSTOM_ID: h:contact-resolution
+:END:
+
+#+findex: sgn-contacts-get-name
+#+findex: sgn-contacts-set-name
+#+findex: sgn-contacts-display-sender
+#+findex: sgn-contacts-completing-read
+#+findex: sgn-contacts-load-from-db
+The function ~sgn-contacts-get-name~ returns the display name for a Signal ID (phone number or group ID).  If no name is cached, it returns the ID itself as a fallback.
+
+The function ~sgn-contacts-set-name~ stores a display name for a Signal ID in the in-memory cache.  This is called automatically when messages arrive with sender name information.
+
+The function ~sgn-contacts-display-sender~ returns a display string for a sender.  If SENDER matches ~sgn-account~, it returns ="You"=; otherwise it resolves the name via ~sgn-contacts-get-name~.
+
+The function ~sgn-contacts-completing-read~ presents a ~completing-read~ interface for selecting a chat.  Candidates are sorted by recency and annotated with unread counts and relative timestamps.  Duplicate display names are disambiguated with a phone number or group ID suffix.  Returns the selected chat ID, not the display name.
+
+The function ~sgn-contacts-load-from-db~ loads contact names from the database into the in-memory cache.  Called during startup.
+
+** Chat buffer management
+:PROPERTIES:
+:CUSTOM_ID: h:chat-buffer-management
+:END:
+
+#+findex: sgn-chat-get-buffer
+#+findex: sgn-chat-open
+#+findex: sgn-chat-insert-message
+#+findex: sgn-chat-update-message
+#+findex: sgn-chat-show-typing
+#+findex: sgn-chat-clear-typing
+#+findex: sgn-chat-insert-system-msg
+#+findex: sgn-chat-message-at-point
+The function ~sgn-chat-get-buffer~ returns the buffer for a given chat ID, creating it if necessary.  Buffer names follow the pattern =*sgn: <display-name>*=.  When a name collision occurs (two different chats with the same display name), a disambiguating suffix is appended.
+
+The function ~sgn-chat-open~ opens a chat buffer and switches to it, positioning point at the end and marking the chat as read.
+
+The function ~sgn-chat-insert-message~ renders a new incoming or sync message into the appropriate chat buffer.  It inserts before the input prompt and scrolls to the bottom if the buffer is visible.
+
+The function ~sgn-chat-update-message~ re-renders a specific message by its ROWID.  This is used after edits, deletions, or reaction changes to refresh the display.
+
+The function ~sgn-chat-show-typing~ displays a typing indicator for a given sender in the header line of the appropriate chat buffer.  The indicator auto-clears after ten seconds.
+
+The function ~sgn-chat-clear-typing~ removes the typing indicator from the current buffer's header line.
+
+The function ~sgn-chat-insert-system-msg~ inserts a system message (such as an error or status notification) into a chat buffer.  The message is rendered with a configurable face, defaulting to ~sgn-error-face~.
+
+The function ~sgn-chat-message-at-point~ returns a plist describing the message at point, including ~:rowid~, ~:timestamp~, ~:sender~, ~:chat-id~, and ~:target-author~.  This is the foundation for all point-based message actions ([[#h:message-actions][Message actions]]).
+
+** Database operations
+:PROPERTIES:
+:CUSTOM_ID: h:database-operations
+:END:
+
+#+findex: sgn-db-init
+#+findex: sgn-db-close
+#+findex: sgn-db-search
+#+findex: sgn-db-purge-expired
+The function ~sgn-db-init~ initializes the SQLite database.  It creates the database directory if needed, verifies FTS5 support, enables WAL journaling, and creates all tables on first run.  Called by ~sgn-start~.
+
+The function ~sgn-db-close~ closes the database connection.
+
+The function ~sgn-db-search~ performs a full-text search using FTS5.  It accepts a QUERY string, an optional CHAT-ID to restrict the search, and an optional LIMIT.  Results include a ~:snippet~ key with highlighted matches delimited by brackets.  Deleted messages are excluded.
+
+The function ~sgn-db-purge-expired~ deletes messages whose expiration timestamp has passed.  It runs periodically on a timer started by ~sgn-start~.
+
+** RPC layer
+:PROPERTIES:
+:CUSTOM_ID: h:rpc-layer
+:END:
+
+#+findex: sgn-rpc-start
+#+findex: sgn-rpc-stop
+#+findex: sgn-rpc-alive-p
+#+findex: sgn-rpc-send
+#+findex: sgn-rpc-send-message
+The function ~sgn-rpc-start~ starts the =signal-cli= JSON-RPC subprocess.  It resets all internal state and launches the process with a filter and sentinel for handling incoming data.
+
+The function ~sgn-rpc-stop~ stops the subprocess.
+
+The function ~sgn-rpc-alive-p~ returns non-nil if the subprocess is running.
+
+The function ~sgn-rpc-send~ sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay.
+
+The function ~sgn-rpc-send-message~ is a convenience wrapper that sends a text message to a chat ID, with optional extras (attachments, quote parameters, edit timestamp).
+
+** Media rendering
+:PROPERTIES:
+:CUSTOM_ID: h:media-rendering-functions
+:END:
+
+#+findex: sgn-media-insert
+#+findex: sgn-media-insert-inline-image
+#+findex: sgn-media-find-sticker
+#+findex: sgn-media-insert-voice-note
+#+findex: sgn-media-play-audio
+#+findex: sgn-media-insert-link-preview
+The function ~sgn-media-insert~ is the main entry point for rendering media in a chat buffer.  It handles both attachments (images, files) and stickers, dispatching to the appropriate rendering function.
+
+The function ~sgn-media-insert-inline-image~ creates and inserts an Emacs image object from a file path.  It respects ~sgn-image-max-width~ and animates multi-frame images when ~sgn-enable-animation~ is non-nil.
+
+The function ~sgn-media-find-sticker~ locates the local file for a sticker by pack ID and sticker ID.  It first checks the pack's =manifest.json=, then falls back to searching by numeric ID with common extensions.
+
+The function ~sgn-media-insert-voice-note~ inserts a clickable voice note element displaying the duration and a play button.
+
+The function ~sgn-media-play-audio~ plays an audio file.  It prefers Emacs's built-in ~play-sound-file~ when available, falling back to external players (=afplay= on macOS, =paplay= or =aplay= on Linux).
+
+The function ~sgn-media-insert-link-preview~ renders a box-drawing framed link preview with title, description, domain, and optional thumbnail.  Pressing ~RET~ on the preview opens the URL in a browser.
+
+** Text formatting
+:PROPERTIES:
+:CUSTOM_ID: h:text-formatting-functions
+:END:
+
+#+findex: sgn-format-apply-styles
+#+findex: sgn-format-parse-markup
+#+findex: sgn-format-styles-to-json
+The function ~sgn-format-apply-styles~ applies Signal text style ranges to a string.  It accepts TEXT and a STYLES-JSON string (a JSON array of objects with ~start~, ~length~, and ~style~ keys).  The supported styles are BOLD, ITALIC, STRIKETHROUGH, MONOSPACE, and SPOILER, each mapped to an appropriate Emacs face.  Spoiler text additionally receives the ~sgn-spoiler~ text property for use by ~sgn-format-reveal-spoiler-at-point~ ([[#h:text-formatting][Text formatting commands]]).
+
+The function ~sgn-format-parse-markup~ parses lightweight markup in user input.  It returns a plist with ~:text~ (the plain text with delimiters removed) and ~:styles~ (a list of style alists ready for Signal's API).  The supported markup delimiters are =*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, and =||spoiler||=.  Backslash-escaped delimiters are treated as literals.
+
+The function ~sgn-format-styles-to-json~ serializes a list of style alists into a JSON array string suitable for database storage.
+
+** Notification helpers
+:PROPERTIES:
+:CUSTOM_ID: h:notification-helpers
+:END:
+
+#+findex: sgn-notify-update
+#+findex: sgn-notify-message
+The function ~sgn-notify-update~ recalculates the global unread count from the database and updates the modeline or tab-bar indicator.  Muted chats are excluded from the count.
+
+The function ~sgn-notify-message~ shows a desktop notification for a new message.  It is suppressed for muted chats.  The notification includes the sender name and a truncated message preview.
+
+** Mention and poll rendering
+:PROPERTIES:
+:CUSTOM_ID: h:mention-and-poll-rendering
+:END:
+
+#+findex: sgn-actions-apply-mentions
+#+findex: sgn-actions-render-poll
+The function ~sgn-actions-apply-mentions~ applies mention highlighting to a text string.  Mentions of self use ~sgn-mention-self-face~; mentions of others use ~sgn-mention-face~.
+
+The function ~sgn-actions-render-poll~ renders a poll into the current buffer, displaying the question, options with vote bar charts, vote counts, and a voting prompt (or "Poll closed" indicator).
+
+* Indices
+:PROPERTIES:
+:CUSTOM_ID: h:indices
+:END:
+
+** Function index
+:PROPERTIES:
+:INDEX: fn
+:CUSTOM_ID: h:function-index
+:END:
+
+** Variable index
+:PROPERTIES:
+:INDEX: vr
+:CUSTOM_ID: h:variable-index
+:END:

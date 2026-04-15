@@ -91,10 +91,9 @@
 
 \\{sgn-dashboard-mode-map}"
   (setq tabulated-list-format
-        [("" 2 t)                         ; pin/unread indicator
-         ("Chat" 38 t)                    ; chat name
+        [("Chat" 38 t)                    ; chat name
          ("Last message" 42 t)            ; preview
-         ("Time" 7 sgn-dashboard--sort-by-time :right-align t)
+         ("Time" 7 t :right-align t)      ; timestamp
          ("" 5 t)])                       ; unread count
   (setq tabulated-list-padding 0)
   (setq tabulated-list-sort-key nil)      ; we sort ourselves
@@ -108,17 +107,17 @@
 
 ;;;; Sorting
 
-(defun sgn-dashboard--sort-by-time (a b)
-  "Sort entries A and B by timestamp (most recent first).
-Pinned chats always come before unpinned."
-  (let ((a-pinned (get-text-property 0 'sgn-pinned (elt (cadr a) 0)))
-        (b-pinned (get-text-property 0 'sgn-pinned (elt (cadr b) 0)))
-        (a-ts (get-text-property 0 'sgn-timestamp (elt (cadr a) 3)))
-        (b-ts (get-text-property 0 'sgn-timestamp (elt (cadr b) 3))))
-    (cond
-     ((and a-pinned (not b-pinned)) t)
-     ((and b-pinned (not a-pinned)) nil)
-     (t (> (or a-ts 0) (or b-ts 0))))))
+(defun sgn-dashboard--entry-sort-key (entry)
+  "Return a sort key for ENTRY: (PINNED-P HAS-TS-P TIMESTAMP NAME).
+Pinned first, then chats with timestamps by recency, then the
+rest alphabetically."
+  (let* ((vec (cadr entry))
+         (name-str (elt vec 0))
+         (time-str (elt vec 2))
+         (pinned (get-text-property 0 'sgn-pinned name-str))
+         (ts (get-text-property 0 'sgn-timestamp time-str))
+         (name-lower (downcase (substring-no-properties name-str))))
+    (list pinned (and ts (> ts 0)) (or ts 0) name-lower)))
 
 ;;;; Building entries
 
@@ -146,25 +145,18 @@ Skip chats with empty or missing names."
          (preview (sgn-dashboard--get-preview id))
          (has-unread (> unread 0))
          ;; Column values
-         (col-indicator (sgn-dashboard--make-indicator pinned has-unread))
-         (col-name (sgn-dashboard--make-name name has-unread))
+         (col-name (sgn-dashboard--make-name name has-unread pinned))
          (col-preview (sgn-dashboard--make-preview preview muted))
          (col-time (sgn-dashboard--make-time last-ts))
          (col-unread (sgn-dashboard--make-unread unread)))
-    (list id (vector col-indicator col-name col-preview col-time col-unread))))
+    (list id (vector col-name col-preview col-time col-unread))))
 
-(defun sgn-dashboard--make-indicator (pinned has-unread)
-  "Build indicator column string for PINNED and HAS-UNREAD state."
-  (let ((str (cond (pinned "📌")
-                   (has-unread " ●")
-                   (t "  "))))
-    (propertize str 'sgn-pinned pinned)))
-
-(defun sgn-dashboard--make-name (name has-unread)
-  "Build NAME column, bold if HAS-UNREAD."
-  (if has-unread
-      (propertize name 'face 'sgn-dashboard-name-unread-face)
-    name))
+(defun sgn-dashboard--make-name (name has-unread pinned)
+  "Build NAME column.  Bold if HAS-UNREAD, pin prefix if PINNED."
+  (let ((display (if pinned (concat "📌 " name) name)))
+    (propertize display
+                'face (when has-unread 'sgn-dashboard-name-unread-face)
+                'sgn-pinned pinned)))
 
 (defun sgn-dashboard--make-preview (preview muted)
   "Build PREVIEW column.  Append mute icon if MUTED."
@@ -242,13 +234,28 @@ Skip chats with empty or missing names."
     (switch-to-buffer buf)))
 
 (defun sgn-dashboard--populate ()
-  "Populate the dashboard with current data."
+  "Populate the dashboard with current data.
+Sort order: pinned first, then chats with messages by recency,
+then remaining chats alphabetically."
   (let ((entries (sgn-dashboard--build-entries)))
-    ;; Sort: pinned first, then by timestamp descending
     (setq entries
           (sort entries
                 (lambda (a b)
-                  (sgn-dashboard--sort-by-time a b))))
+                  (let ((ka (sgn-dashboard--entry-sort-key a))
+                        (kb (sgn-dashboard--entry-sort-key b)))
+                    ;; Compare: (pinned has-ts timestamp name)
+                    (cond
+                     ;; Pinned first
+                     ((and (nth 0 ka) (not (nth 0 kb))) t)
+                     ((and (nth 0 kb) (not (nth 0 ka))) nil)
+                     ;; Has-timestamp before no-timestamp
+                     ((and (nth 1 ka) (not (nth 1 kb))) t)
+                     ((and (nth 1 kb) (not (nth 1 ka))) nil)
+                     ;; Both have timestamps: most recent first
+                     ((and (nth 1 ka) (nth 1 kb))
+                      (> (nth 2 ka) (nth 2 kb)))
+                     ;; Neither has timestamps: alphabetical
+                     (t (string< (nth 3 ka) (nth 3 kb))))))))
     (setq tabulated-list-entries entries)
     (tabulated-list-print t)))
 

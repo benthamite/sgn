@@ -41,16 +41,42 @@
 ;;;; Key extraction
 
 (defun sgn-import--read-key ()
-  "Read the SQLCipher key from Signal Desktop's config.json."
+  "Read the SQLCipher key from Signal Desktop's config.json.
+Handles both the legacy plain `key' field and the newer
+`encryptedKey' field (Chromium safeStorage, decrypted via
+macOS Keychain + PBKDF2 + AES-128-CBC)."
   (unless (file-exists-p sgn-import--desktop-config-path)
     (user-error "Signal Desktop config not found: %s"
                 sgn-import--desktop-config-path))
   (let* ((json-object-type 'alist)
          (config (json-read-file sgn-import--desktop-config-path))
-         (key (alist-get 'key config)))
-    (unless key
-      (user-error "No key found in Signal Desktop config"))
-    key))
+         (plain-key (alist-get 'key config))
+         (encrypted-key (alist-get 'encryptedKey config)))
+    (cond
+     (plain-key plain-key)
+     (encrypted-key (sgn-import--decrypt-safe-storage-key encrypted-key))
+     (t (user-error "No key or encryptedKey found in Signal Desktop config")))))
+
+(defun sgn-import--decrypt-safe-storage-key (encrypted-hex)
+  "Decrypt Chromium safeStorage ENCRYPTED-HEX using macOS Keychain.
+Returns the hex DB key string."
+  (let* ((keychain-pass (string-trim
+                         (shell-command-to-string
+                          "security find-generic-password -s 'Signal Safe Storage' -w 2>/dev/null || security find-generic-password -s 'Signal' -w")))
+         (script (format
+                  "const crypto = require('crypto');\
+const enc = Buffer.from('%s', 'hex');\
+const key = crypto.pbkdf2Sync('%s', 'saltysalt', 1003, 16, 'sha1');\
+const iv = Buffer.alloc(16, 32);\
+const d = crypto.createDecipheriv('aes-128-cbc', key, iv);\
+process.stdout.write(Buffer.concat([d.update(enc.subarray(3)), d.final()]).toString('utf8'));"
+                  encrypted-hex keychain-pass))
+         (result (with-temp-buffer
+                   (call-process "node" nil t nil "-e" script)
+                   (buffer-string))))
+    (when (string-empty-p result)
+      (user-error "Failed to decrypt Signal Desktop encryptedKey"))
+    result))
 
 ;;;; Export via sqlcipher
 

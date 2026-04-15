@@ -10,12 +10,14 @@
 ;;; Commentary:
 
 ;; Telega-style root buffer showing all conversations using
-;; `tabulated-list-mode'.  Pinned chats on top, unread badges, last
-;; message preview, mute indicators, and keyboard navigation.
+;; `tabulated-list-mode'.  Per-column faces, fade-out truncation
+;; (spofy-style gradient instead of ellipsis), pinned chats on top,
+;; unread badges, and keyboard navigation.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'color)
 (require 'tabulated-list)
 
 (declare-function sgn--log "sgn")
@@ -38,8 +40,6 @@
 
 ;;;; Keymap
 
-;; Use `setq' (not `defvar') so reloading this file always installs
-;; the correct bindings, even when an older keymap is already bound.
 (defvar sgn-dashboard-mode-map nil
   "Keymap for `sgn-dashboard-mode'.")
 (setq sgn-dashboard-mode-map
@@ -59,30 +59,115 @@
 
 ;;;; Faces
 
-(defface sgn-dashboard-unread-face
-  '((t :inherit warning :weight bold))
-  "Face for unread count in the dashboard."
+(defface sgn-dashboard-name-face
+  '((t :inherit font-lock-keyword-face))
+  "Face for chat names."
   :group 'sgn)
 
 (defface sgn-dashboard-name-unread-face
-  '((t :weight bold))
+  '((t :inherit font-lock-keyword-face :weight bold))
   "Face for chat names with unread messages."
   :group 'sgn)
 
 (defface sgn-dashboard-preview-face
-  '((t :inherit shadow))
+  '((t :inherit font-lock-comment-face))
   "Face for message preview text."
   :group 'sgn)
 
 (defface sgn-dashboard-time-face
-  '((t :inherit shadow))
+  '((t :inherit font-lock-type-face))
   "Face for timestamp column."
+  :group 'sgn)
+
+(defface sgn-dashboard-unread-face
+  '((t :inherit warning :weight bold))
+  "Face for unread count."
   :group 'sgn)
 
 (defface sgn-dashboard-muted-face
   '((t :inherit shadow))
   "Face for muted indicator."
   :group 'sgn)
+
+;;;; Fade-out truncation (adapted from spofy-ui)
+
+(defun sgn-dashboard--truncate (string max-width &optional face)
+  "Truncate STRING to MAX-WIDTH with fade effect.
+When FACE is non-nil, apply it.  If truncated, mark the last
+three characters with `sgn-fade' property for post-render
+gradient blending."
+  (let* ((truncated (> (string-width string) max-width))
+         (result (if truncated
+                     (truncate-string-to-width string max-width)
+                   string)))
+    (when face
+      (setq result (propertize result 'face face)))
+    (when truncated
+      (let ((len (length result)))
+        (when (>= len 3)
+          (dotimes (i 3)
+            (put-text-property (+ (- len 3) i) (+ (- len 3) i 1)
+                               'sgn-fade (1+ i) result)))))
+    result))
+
+(defun sgn-dashboard--blend-color (fg bg ratio)
+  "Blend FG toward BG by RATIO (0.0 = pure FG, 1.0 = pure BG).
+Return a hex color string, or nil if either color is unresolvable."
+  (let ((fv (color-values fg))
+        (bv (color-values bg)))
+    (when (and fv bv)
+      (format "#%02x%02x%02x"
+              (ash (round (+ (* (- 1.0 ratio) (nth 0 fv))
+                             (* ratio (nth 0 bv))))
+                   -8)
+              (ash (round (+ (* (- 1.0 ratio) (nth 1 fv))
+                             (* ratio (nth 1 bv))))
+                   -8)
+              (ash (round (+ (* (- 1.0 ratio) (nth 2 fv))
+                             (* ratio (nth 2 bv))))
+                   -8)))))
+
+(defun sgn-dashboard--resolve-foreground (face-val)
+  "Resolve the effective foreground color from FACE-VAL."
+  (cond
+   ((symbolp face-val)
+    (face-foreground face-val nil t))
+   ((consp face-val)
+    (cl-some (lambda (f)
+               (and (facep f) (face-foreground f nil t)))
+             face-val))))
+
+(defvar-local sgn-dashboard--fade-overlays nil
+  "Overlays for the truncation fade effect.")
+
+(defun sgn-dashboard--apply-fades ()
+  "Create fade overlays for characters marked with `sgn-fade'.
+Levels 1/2/3 blend foreground toward background at 25%/50%/75%."
+  (mapc #'delete-overlay sgn-dashboard--fade-overlays)
+  (setq sgn-dashboard--fade-overlays nil)
+  (let ((bg (face-background 'default nil t)))
+    (when bg
+      (save-excursion
+        (goto-char (point-min))
+        (let ((pos (point-min)))
+          (while (< pos (point-max))
+            (let ((level (get-text-property pos 'sgn-fade)))
+              (if (not level)
+                  (setq pos (or (next-single-property-change
+                                 pos 'sgn-fade nil (point-max))
+                                (point-max)))
+                (let* ((face-val (get-text-property pos 'face))
+                       (fg (or (sgn-dashboard--resolve-foreground face-val)
+                               (face-foreground 'default nil t)))
+                       (ratio (* 0.25 level))
+                       (blended (when fg
+                                  (sgn-dashboard--blend-color fg bg ratio))))
+                  (when blended
+                    (let ((ov (make-overlay pos (1+ pos))))
+                      (overlay-put ov 'face (list :foreground blended))
+                      (overlay-put ov 'sgn-fade t)
+                      (push ov sgn-dashboard--fade-overlays))))
+                (setq pos (1+ pos))))))))))
 
 ;;;; Major mode
 
@@ -95,9 +180,10 @@
          ("Last message" 42 t)            ; preview
          ("Time" 7 t :right-align t)      ; timestamp
          ("" 5 t)])                       ; unread count
-  (setq tabulated-list-padding 0)
-  (setq tabulated-list-sort-key nil)      ; we sort ourselves
+  (setq tabulated-list-padding 1)
+  (setq tabulated-list-sort-key nil)
   (setq-local truncate-lines t)
+  (setq-local truncate-string-ellipsis "")
   (setq-local revert-buffer-function #'sgn-dashboard--revert)
   (tabulated-list-init-header))
 
@@ -108,9 +194,7 @@
 ;;;; Sorting
 
 (defun sgn-dashboard--entry-sort-key (entry)
-  "Return a sort key for ENTRY: (PINNED-P HAS-TS-P TIMESTAMP NAME).
-Pinned first, then chats with timestamps by recency, then the
-rest alphabetically."
+  "Return a sort key for ENTRY: (PINNED-P HAS-TS-P TIMESTAMP NAME)."
   (let* ((vec (cadr entry))
          (name-str (elt vec 0))
          (time-str (elt vec 2))
@@ -122,8 +206,7 @@ rest alphabetically."
 ;;;; Building entries
 
 (defun sgn-dashboard--build-entries ()
-  "Build the tabulated-list entries from the database.
-Skip chats with empty or missing names."
+  "Build the tabulated-list entries from the database."
   (let ((chats (sgn-db-get-chats t)))
     (cl-loop for chat in chats
              for name = (or (plist-get chat :name)
@@ -144,7 +227,6 @@ Skip chats with empty or missing names."
          (last-ts (plist-get chat :last-msg-ts))
          (preview (sgn-dashboard--get-preview id))
          (has-unread (> unread 0))
-         ;; Column values
          (col-name (sgn-dashboard--make-name name has-unread pinned))
          (col-preview (sgn-dashboard--make-preview preview muted))
          (col-time (sgn-dashboard--make-time last-ts))
@@ -152,16 +234,18 @@ Skip chats with empty or missing names."
     (list id (vector col-name col-preview col-time col-unread))))
 
 (defun sgn-dashboard--make-name (name has-unread pinned)
-  "Build NAME column.  Bold if HAS-UNREAD, pin prefix if PINNED."
-  (let ((display (if pinned (concat "📌 " name) name)))
-    (propertize display
-                'face (when has-unread 'sgn-dashboard-name-unread-face)
+  "Build NAME column with face and fade truncation."
+  (let* ((display (if pinned (concat "📌 " name) name))
+         (face (if has-unread
+                   'sgn-dashboard-name-unread-face
+                 'sgn-dashboard-name-face)))
+    (propertize (sgn-dashboard--truncate display 37 face)
                 'sgn-pinned pinned)))
 
 (defun sgn-dashboard--make-preview (preview muted)
-  "Build PREVIEW column.  Append mute icon if MUTED."
+  "Build PREVIEW column with face and fade truncation."
   (let ((text (if preview
-                  (propertize preview 'face 'sgn-dashboard-preview-face)
+                  (sgn-dashboard--truncate preview 41 'sgn-dashboard-preview-face)
                 "")))
     (if muted
         (concat text (propertize " 🔇" 'face 'sgn-dashboard-muted-face))
@@ -197,12 +281,9 @@ Skip chats with empty or missing names."
          ((and deleted (not (zerop deleted)))
           "[deleted]")
          (body
-          (let ((text (format "%s: %s"
-                              sender-name
-                              (replace-regexp-in-string "\n" " " body))))
-            (if (> (length text) 60)
-                (concat (substring text 0 57) "…")
-              text)))
+          (format "%s: %s"
+                  sender-name
+                  (replace-regexp-in-string "\n" " " body)))
          (t
           (format "%s: [media]" sender-name)))))))
 
@@ -234,30 +315,24 @@ Skip chats with empty or missing names."
     (switch-to-buffer buf)))
 
 (defun sgn-dashboard--populate ()
-  "Populate the dashboard with current data.
-Sort order: pinned first, then chats with messages by recency,
-then remaining chats alphabetically."
+  "Populate the dashboard with current data."
   (let ((entries (sgn-dashboard--build-entries)))
     (setq entries
           (sort entries
                 (lambda (a b)
                   (let ((ka (sgn-dashboard--entry-sort-key a))
                         (kb (sgn-dashboard--entry-sort-key b)))
-                    ;; Compare: (pinned has-ts timestamp name)
                     (cond
-                     ;; Pinned first
                      ((and (nth 0 ka) (not (nth 0 kb))) t)
                      ((and (nth 0 kb) (not (nth 0 ka))) nil)
-                     ;; Has-timestamp before no-timestamp
                      ((and (nth 1 ka) (not (nth 1 kb))) t)
                      ((and (nth 1 kb) (not (nth 1 ka))) nil)
-                     ;; Both have timestamps: most recent first
                      ((and (nth 1 ka) (nth 1 kb))
                       (> (nth 2 ka) (nth 2 kb)))
-                     ;; Neither has timestamps: alphabetical
                      (t (string< (nth 3 ka) (nth 3 kb))))))))
     (setq tabulated-list-entries entries)
-    (tabulated-list-print t)))
+    (tabulated-list-print t)
+    (sgn-dashboard--apply-fades)))
 
 (defun sgn-dashboard-refresh ()
   "Refresh the dashboard."

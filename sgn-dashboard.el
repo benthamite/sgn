@@ -88,12 +88,12 @@
 
 \\{sgn-dashboard-mode-map}"
   (setq tabulated-list-format
-        [("" 3 t)                         ; pin/unread indicator
-         ("Name" 25 t)                    ; chat name
-         ("Last message" 40 t)            ; preview
-         ("Time" 8 sgn-dashboard--sort-by-time :right-align t)
-         ("" 6 t)])                       ; unread count
-  (setq tabulated-list-padding 1)
+        [("" 2 t)                         ; pin/unread indicator
+         ("Chat" 32 t)                    ; chat name
+         ("Last message" 42 t)            ; preview
+         ("Time" 7 sgn-dashboard--sort-by-time :right-align t)
+         ("" 5 t)])                       ; unread count
+  (setq tabulated-list-padding 0)
   (setq tabulated-list-sort-key nil)      ; we sort ourselves
   (setq-local truncate-lines t)
   (setq-local revert-buffer-function #'sgn-dashboard--revert)
@@ -120,9 +120,14 @@ Pinned chats always come before unpinned."
 ;;;; Building entries
 
 (defun sgn-dashboard--build-entries ()
-  "Build the tabulated-list entries from the database."
+  "Build the tabulated-list entries from the database.
+Skip chats with empty or missing names."
   (let ((chats (sgn-db-get-chats t)))
-    (mapcar #'sgn-dashboard--chat-to-entry chats)))
+    (cl-loop for chat in chats
+             for name = (or (plist-get chat :name)
+                            (sgn-contacts-get-name (plist-get chat :id)))
+             when (and name (not (string-empty-p (string-trim name))))
+             collect (sgn-dashboard--chat-to-entry chat))))
 
 (defun sgn-dashboard--chat-to-entry (chat)
   "Convert a CHAT plist to a tabulated-list entry."
@@ -136,11 +141,12 @@ Pinned chats always come before unpinned."
                       (not (zerop (plist-get chat :pinned)))))
          (last-ts (plist-get chat :last-msg-ts))
          (preview (sgn-dashboard--get-preview id))
+         (chat-type (plist-get chat :type))
          (has-unread (> unread 0))
          ;; Column values
          (col-indicator (sgn-dashboard--make-indicator pinned has-unread))
          (col-name (sgn-dashboard--make-name name has-unread))
-         (col-preview (sgn-dashboard--make-preview preview muted))
+         (col-preview (sgn-dashboard--make-preview preview muted chat-type))
          (col-time (sgn-dashboard--make-time last-ts))
          (col-unread (sgn-dashboard--make-unread unread)))
     (list id (vector col-indicator col-name col-preview col-time col-unread))))
@@ -158,9 +164,15 @@ Pinned chats always come before unpinned."
       (propertize name 'face 'sgn-dashboard-name-unread-face)
     name))
 
-(defun sgn-dashboard--make-preview (preview muted)
-  "Build PREVIEW column.  Append mute icon if MUTED."
-  (let ((text (propertize (or preview "") 'face 'sgn-dashboard-preview-face)))
+(defun sgn-dashboard--make-preview (preview muted chat-type)
+  "Build PREVIEW column.  Append mute icon if MUTED.
+CHAT-TYPE is shown as a dim hint when PREVIEW is nil."
+  (let* ((base (or preview
+                   (propertize (if (equal chat-type "group") "group" "contact")
+                               'face 'shadow)))
+         (text (if preview
+                   (propertize preview 'face 'sgn-dashboard-preview-face)
+                 base)))
     (if muted
         (concat text (propertize " 🔇" 'face 'sgn-dashboard-muted-face))
       text)))

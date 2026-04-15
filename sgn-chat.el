@@ -36,6 +36,7 @@
 (declare-function sgn-media-insert-voice-note "sgn-media")
 (declare-function sgn-media-insert-link-preview "sgn-media")
 (declare-function sgn-format-apply-styles "sgn-format")
+(declare-function sgn-notify-update "sgn-notify")
 (declare-function sgn-react "sgn-actions")
 (declare-function sgn-reply "sgn-actions")
 (declare-function sgn-edit "sgn-actions")
@@ -226,6 +227,7 @@ Keys: :timestamp :rowid :body")
   "Mark the current chat as read and send read receipts if enabled."
   (when sgn-chat-id
     (sgn-db-set-unread sgn-chat-id 0)
+    (sgn-notify-update)
     ;; Send read receipts for visible messages
     (when (and sgn-send-read-receipts
                (sgn-rpc-alive-p)

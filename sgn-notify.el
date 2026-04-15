@@ -188,6 +188,7 @@ reliably)."
   "Global minor mode that shows Signal unread count indicator."
   :global t
   :lighter nil
+  :group 'sgn
   :keymap sgn-global-mode-map
   (if sgn-global-mode
       (progn

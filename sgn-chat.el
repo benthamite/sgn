@@ -491,15 +491,7 @@ Sends typing indicators."
   (interactive)
   (if sgn-chat--all-loaded
       (message "All history loaded.")
-    (let* ((older (sgn-db-get-messages sgn-chat-id
-                                       sgn-history-page-size
-                                       sgn-history-page-size))
-           ;; Actually we need messages older than the oldest loaded
-           ;; This requires an offset-based or timestamp-based query
-           ;; For now, use a simple approach
-           )
-      ;; TODO: implement proper pagination with timestamp cursor
-      (message "Load more history: not yet implemented (Phase 2)"))))
+    (message "Load more history: not yet implemented (Phase 2)")))
 
 ;;;; Message rendering
 

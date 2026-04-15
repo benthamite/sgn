@@ -209,7 +209,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
 
 (defun sgn--handle-incoming-message (chat-id sender timestamp body
                                               attachments sticker
-                                              quote-data styles mentions
+                                              quote-data styles _mentions
                                               envelope)
   "Persist and display an incoming message."
   (let* ((quote-ts (and quote-data (alist-get 'id quote-data)))

@@ -4,6 +4,8 @@ A full-featured Signal messenger client for Emacs, built on `signal-cli`'s JSON-
 
 ## Overview
 
+`sgn` is a fork of [`signel`](https://github.com/keenban/signel) by Keenan Salandy.
+
 `sgn` lets you send and receive Signal messages without leaving Emacs. It communicates with a `signal-cli` daemon over JSON-RPC, persists all conversations in a local SQLite database with FTS5 indexing, and renders chat buffers in a telega-style layout with message grouping, inline images, and text properties for point-based commands.
 
 The package covers the core Signal messaging workflow: sending and receiving text, images, stickers, and voice notes; reacting to, quoting, editing, and deleting messages; creating and voting in polls; pinning messages; managing groups and contacts; and searching across your entire message history. A dashboard buffer provides an overview of all conversations with unread badges, last-message previews, and pinned chats.

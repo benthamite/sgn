@@ -37,6 +37,10 @@
 (declare-function sgn-media-insert-link-preview "sgn-media")
 (declare-function sgn-format-apply-styles "sgn-format")
 (declare-function sgn-notify-update "sgn-notify")
+(declare-function sgn-db-insert-message "sgn-db")
+(declare-function sgn-db-upsert-chat "sgn-db")
+(declare-function sgn-db-get-message-by-rowid "sgn-db")
+(declare-function sgn-dashboard-refresh "sgn-dashboard")
 (declare-function sgn-react "sgn-actions")
 (declare-function sgn-reply "sgn-actions")
 (declare-function sgn-edit "sgn-actions")
@@ -351,21 +355,26 @@ Keys: :timestamp :rowid :body")
   (let* ((parsed (sgn-format-parse-markup text))
          (plain (plist-get parsed :text))
          (styles (plist-get parsed :styles))
+         (styles-json (when styles (sgn-format-styles-to-json styles)))
          (extras (when styles
                    `((textStyle . ,(vconcat styles))))))
-    (sgn-rpc-send-message chat-id plain extras)))
+    (sgn-rpc-send-message chat-id plain extras)
+    (sgn-chat--persist-and-render-sent chat-id plain styles-json nil nil nil)))
 
 (defun sgn-chat--do-send-reply (chat-id text quote-ts quote-author quote-body)
   "Send TEXT as a reply in CHAT-ID."
   (let* ((parsed (sgn-format-parse-markup text))
          (plain (plist-get parsed :text))
          (styles (plist-get parsed :styles))
+         (styles-json (when styles (sgn-format-styles-to-json styles)))
          (extras `((quoteTimestamp . ,quote-ts)
                    (quoteAuthor . ,quote-author)
                    (quoteMessage . ,(or quote-body "")))))
     (when styles
       (push `(textStyle . ,(vconcat styles)) extras))
-    (sgn-rpc-send-message chat-id plain extras)))
+    (sgn-rpc-send-message chat-id plain extras)
+    (sgn-chat--persist-and-render-sent
+     chat-id plain styles-json quote-ts quote-author quote-body)))
 
 (defun sgn-chat--do-send-edit (chat-id text edit-ts)
   "Send edited TEXT for message at EDIT-TS in CHAT-ID."
@@ -375,6 +384,30 @@ Keys: :timestamp :rowid :body")
          (extras (when styles
                    `((textStyle . ,(vconcat styles))))))
     (sgn-rpc-send-edit chat-id plain edit-ts extras)))
+
+(defun sgn-chat--persist-and-render-sent (chat-id body styles-json
+                                                   quote-ts quote-author
+                                                   quote-body)
+  "Persist and render a sent message optimistically.
+CHAT-ID, BODY, STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and
+QUOTE-BODY describe the message."
+  (let* ((timestamp (truncate (* (float-time) 1000)))
+         (rowid (sgn-db-insert-message
+                 (list :chat-id chat-id
+                       :sender sgn-account
+                       :timestamp timestamp
+                       :body body
+                       :type "sync"
+                       :quote-ts quote-ts
+                       :quote-author quote-author
+                       :quote-body quote-body
+                       :styles-json styles-json))))
+    (sgn-db-upsert-chat chat-id :last-msg-ts timestamp)
+    (when rowid
+      (let ((msg (sgn-db-get-message-by-rowid rowid)))
+        (when msg
+          (sgn-chat-insert-message msg))))
+    (sgn-dashboard-refresh)))
 
 ;;;; Cancel reply/edit
 

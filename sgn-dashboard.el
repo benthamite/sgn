@@ -35,7 +35,7 @@
 
 ;;;; Buffer name
 
-(defconst sgn-dashboard--buffer-name "*Sgn*"
+(defconst sgn-dashboard--buffer-name "*sgn*"
   "Name of the dashboard buffer.")
 
 ;;;; Keymap
@@ -171,7 +171,7 @@ Levels 1/2/3 blend foreground toward background at 25%/50%/75%."
 
 ;;;; Major mode
 
-(define-derived-mode sgn-dashboard-mode tabulated-list-mode "Sgn"
+(define-derived-mode sgn-dashboard-mode tabulated-list-mode "sgn"
   "Major mode for the Signal chat list.
 
 \\{sgn-dashboard-mode-map}"
@@ -306,7 +306,7 @@ Only include chats that have at least one stored message."
 
 ;;;###autoload
 (defun sgn-dashboard ()
-  "Open the Sgn dashboard."
+  "Open the sgn dashboard."
   (interactive)
   (let ((buf (get-buffer-create sgn-dashboard--buffer-name)))
     (with-current-buffer buf

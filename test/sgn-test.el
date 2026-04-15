@@ -60,7 +60,7 @@
        (unwind-protect
            (progn
              (sgn-db-init)
-             (setq ,buf (get-buffer-create (format "*Sgn: %s*" ,id)))
+             (setq ,buf (get-buffer-create (format "*sgn: %s*" ,id)))
              (with-current-buffer ,buf
                (sgn-chat-mode)
                (setq sgn-chat-id ,id)

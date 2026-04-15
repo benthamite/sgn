@@ -151,15 +151,15 @@ mode, signal-cli receives messages automatically."
                :sentinel #'sgn-rpc--process-sentinel
                :coding 'utf-8-unix)))
     (set-process-query-on-exit-flag proc nil)
-    (sgn--log "Sgn RPC process started.")
-    (message "Sgn service started.")))
+    (sgn--log "sgn RPC process started.")
+    (message "sgn service started.")))
 
 (defun sgn-rpc-stop ()
   "Stop the signal-cli JSON-RPC subprocess."
   (when (get-process sgn-rpc--process-name)
     (delete-process sgn-rpc--process-name)
-    (sgn--log "Sgn RPC process stopped.")
-    (message "Sgn service stopped.")))
+    (sgn--log "sgn RPC process stopped.")
+    (message "sgn service stopped.")))
 
 (defun sgn-rpc-alive-p ()
   "Return non-nil if the signal-cli JSON-RPC process is running."
@@ -175,7 +175,7 @@ called with the result value when a successful response arrives.
 The method name is stored alongside the callback so the error
 handler can determine retry eligibility."
   (unless (sgn-rpc-alive-p)
-    (error "Sgn service not running.  M-x sgn-start"))
+    (error "sgn service not running.  M-x sgn-start"))
   (let* ((id (cl-incf sgn-rpc--id-counter))
          (req `((jsonrpc . "2.0")
                 (method . ,method)
@@ -223,7 +223,7 @@ buffer exceeds `sgn-rpc--max-partial-line-length'."
   "Log process EVENT for debugging."
   (sgn--log "Process event: %s" (string-trim event))
   (when (string-prefix-p "exited" event)
-    (message "Sgn process exited.")))
+    (message "sgn process exited.")))
 
 ;;; Dispatch
 

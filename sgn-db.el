@@ -63,7 +63,7 @@ Column names are converted to kebab-case keywords."
 (defun sgn-db--ensure ()
   "Signal an error if the database connection is not open."
   (unless sgn-db--connection
-    (error "Sgn database not initialized; call `sgn-db-init' first")))
+    (error "sgn database not initialized; call `sgn-db-init' first")))
 
 (defun sgn-db--db-path ()
   "Return the full path to the sgn database file."

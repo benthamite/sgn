@@ -172,7 +172,7 @@ Keys: :timestamp :rowid :body")
 
 ;;;; Major mode
 
-(define-derived-mode sgn-chat-mode fundamental-mode "Sgn Chat"
+(define-derived-mode sgn-chat-mode fundamental-mode "sgn Chat"
   "Major mode for Signal chat buffers."
   (setq-local sgn-chat--input-marker (make-marker))
   (setq-local sgn-chat--prompt-start (make-marker))
@@ -185,7 +185,7 @@ Keys: :timestamp :rowid :body")
 (defun sgn-chat-get-buffer (chat-id)
   "Get or create the chat buffer for CHAT-ID."
   (let* ((display-name (sgn-contacts-get-name chat-id))
-         (buf-name (format "*Sgn: %s*" display-name))
+         (buf-name (format "*sgn: %s*" display-name))
          (buffer (get-buffer buf-name)))
     ;; Check for name collision with a different chat
     (when (and buffer
@@ -194,7 +194,7 @@ Keys: :timestamp :rowid :body")
       (let ((suffix (if (string-prefix-p "+" chat-id)
                         chat-id
                       (substring chat-id 0 (min 8 (length chat-id))))))
-        (setq buf-name (format "*Sgn: %s <%s>*" display-name suffix))
+        (setq buf-name (format "*sgn: %s <%s>*" display-name suffix))
         (setq buffer (get-buffer buf-name))))
     (unless buffer
       (setq buffer (get-buffer-create buf-name))
@@ -415,7 +415,7 @@ Sends typing indicators."
 
 (defun sgn-chat-show-typing (chat-id sender)
   "Show that SENDER is typing in CHAT-ID."
-  (let* ((buf (get-buffer (format "*Sgn: %s*" (sgn-contacts-get-name chat-id)))))
+  (let* ((buf (get-buffer (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
     (when (buffer-live-p buf)
       (with-current-buffer buf
         (let ((name (sgn-contacts-display-sender sender)))
@@ -508,7 +508,7 @@ Sends typing indicators."
 MSG is a message plist from the database."
   (let ((chat-id (plist-get msg :chat-id)))
     (when-let* ((buf (get-buffer
-                      (format "*Sgn: %s*"
+                      (format "*sgn: %s*"
                               (sgn-contacts-get-name chat-id)))))
       (when (buffer-live-p buf)
         (with-current-buffer buf
@@ -736,7 +736,7 @@ Handles grouping, headers, body, quotes, reactions, and media."
   "Insert a system message TEXT into the chat buffer for CHAT-ID.
 FACE defaults to `sgn-error-face'."
   (when-let* ((buf (get-buffer
-                    (format "*Sgn: %s*"
+                    (format "*sgn: %s*"
                             (sgn-contacts-get-name chat-id)))))
     (when (buffer-live-p buf)
       (with-current-buffer buf

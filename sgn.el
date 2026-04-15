@@ -25,7 +25,7 @@
 
 ;;; Commentary:
 
-;; Sgn provides a full-featured Signal messenger client for Emacs,
+;; sgn provides a full-featured Signal messenger client for Emacs,
 ;; communicating with a running `signal-cli' daemon via JSON-RPC.
 ;;
 ;; Features:
@@ -287,7 +287,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
                  :removed 0)))
         ;; Re-render message
         (when-let* ((buf (get-buffer
-                          (format "*Sgn: %s*"
+                          (format "*sgn: %s*"
                                   (sgn-contacts-get-name chat-id)))))
           (when (buffer-live-p buf)
             (with-current-buffer buf
@@ -305,7 +305,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
       (let ((rowid (plist-get msg :rowid)))
         (sgn-db-delete-message rowid)
         (when-let* ((buf (get-buffer
-                          (format "*Sgn: %s*"
+                          (format "*sgn: %s*"
                                   (sgn-contacts-get-name chat-id)))))
           (when (buffer-live-p buf)
             (with-current-buffer buf
@@ -326,7 +326,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
                                      :edited-at now-ms
                                      :styles-json styles-json))
         (when-let* ((buf (get-buffer
-                          (format "*Sgn: %s*"
+                          (format "*sgn: %s*"
                                   (sgn-contacts-get-name chat-id)))))
           (when (buffer-live-p buf)
             (with-current-buffer buf
@@ -417,7 +417,7 @@ ENVELOPE is the full envelope, SYNC is the syncMessage."
           (sgn-chat-show-typing chat-id source)
         ;; STOPPED
         (when-let* ((buf (get-buffer
-                          (format "*Sgn: %s*"
+                          (format "*sgn: %s*"
                                   (sgn-contacts-get-name chat-id)))))
           (when (buffer-live-p buf)
             (with-current-buffer buf
@@ -454,7 +454,7 @@ ENVELOPE is the full envelope, SYNC is the syncMessage."
   ;; Only increment for messages from others
   (when (and source (not (equal source sgn-account)))
     ;; Check if chat buffer is focused
-    (let* ((buf (get-buffer (format "*Sgn: %s*"
+    (let* ((buf (get-buffer (format "*sgn: %s*"
                                     (sgn-contacts-get-name chat-id))))
            (focused (and buf
                          (get-buffer-window buf)
@@ -521,7 +521,7 @@ refreshes contacts, and opens the dashboard."
   (run-at-time 2 nil #'sgn-contacts-refresh)
   ;; Enable global indicator
   (sgn-global-mode 1)
-  (message "Sgn started."))
+  (message "sgn started."))
 
 ;;;###autoload
 (defun sgn-stop ()
@@ -532,7 +532,7 @@ refreshes contacts, and opens the dashboard."
   (sgn--stop-expiration-timer)
   (sgn-db-close)
   (sgn-global-mode -1)
-  (message "Sgn stopped."))
+  (message "sgn stopped."))
 
 ;;;###autoload
 (defun sgn-chat (recipient)

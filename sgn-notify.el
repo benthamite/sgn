@@ -62,7 +62,7 @@
   "Update the modeline indicator string."
   (setq sgn-notify--modeline-string
         (if (> sgn-notify--global-unread 0)
-            (propertize (format " [Sgn:%d]" sgn-notify--global-unread)
+            (propertize (format " [sgn:%d]" sgn-notify--global-unread)
                         'face 'sgn-unread-face)
           "")))
 
@@ -82,7 +82,7 @@
 (defun sgn-notify--tab-bar-item ()
   "Return a tab-bar item showing the unread count."
   (when (> sgn-notify--global-unread 0)
-    (propertize (format " Sgn:%d " sgn-notify--global-unread)
+    (propertize (format " sgn:%d " sgn-notify--global-unread)
                 'face 'sgn-unread-face)))
 
 (defun sgn-notify--install-tab-bar ()
@@ -102,7 +102,7 @@
   "Tab bar format function for sgn unread count."
   (when (> sgn-notify--global-unread 0)
     `((sgn-unread menu-item
-                  ,(format " Sgn:%d " sgn-notify--global-unread)
+                  ,(format " sgn:%d " sgn-notify--global-unread)
                   ignore
                   :help "Unread Signal messages"))))
 
@@ -131,7 +131,7 @@ Suppressed for muted chats."
   (when sgn-desktop-notifications
     (let ((chat (sgn-db-get-chat chat-id)))
       (unless (and chat (not (zerop (or (plist-get chat :muted) 0))))
-        (let* ((title (format "Sgn: %s" (sgn-contacts-get-name
+        (let* ((title (format "sgn: %s" (sgn-contacts-get-name
                                           (or sender chat-id))))
                (preview (cond
                          (body (if (> (length body) 100)
@@ -154,7 +154,7 @@ CHAT-ID is used for click-to-open."
     (notifications-notify
      :title title
      :body body
-     :app-name "Sgn"
+     :app-name "sgn"
      :actions '("open" "Open Chat")
      :on-action (lambda (_id _key)
                   (sgn-chat-open chat-id))))

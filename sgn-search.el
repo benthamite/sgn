@@ -45,7 +45,7 @@
 
 ;;;; Major mode
 
-(define-derived-mode sgn-search-mode special-mode "Sgn Search"
+(define-derived-mode sgn-search-mode special-mode "sgn Search"
   "Major mode for Signal message search results.")
 
 ;;;; Search commands
@@ -53,7 +53,7 @@
 ;;;###autoload
 (defun sgn-search (query)
   "Search all conversations for QUERY using FTS5.
-Display results in the *Sgn Search* buffer."
+Display results in the *sgn Search* buffer."
   (interactive "sSearch: ")
   (setq sgn-search--last-query query)
   (let ((results (sgn-db-search query nil 100)))
@@ -79,8 +79,8 @@ Display results in the *Sgn Search* buffer."
 ;;;; Results display
 
 (defun sgn-search--display (query results)
-  "Display search RESULTS for QUERY in the *Sgn Search* buffer."
-  (let ((buf (get-buffer-create "*Sgn Search*")))
+  "Display search RESULTS for QUERY in the *sgn Search* buffer."
+  (let ((buf (get-buffer-create "*sgn Search*")))
     (with-current-buffer buf
       (let ((inhibit-read-only t))
         (erase-buffer)
@@ -123,7 +123,7 @@ Display results in the *Sgn Search* buffer."
     ;; Snippet with search term highlighting
     (insert "  " snippet "\n")
     ;; Chat link
-    (insert (propertize (format "  → *Sgn: %s*" chat-name)
+    (insert (propertize (format "  → *sgn: %s*" chat-name)
                         'face 'link))
     (insert "\n\n")
     ;; Properties for navigation

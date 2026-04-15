@@ -5,7 +5,7 @@
 ;; Author: Keenan Salandy <keenan@salandy.dev>
 ;; Maintainer: Pablo Stafforini <pablo@stafforini.com>
 ;; URL: https://github.com/benthamite/sgn
-;; Version: 0.2.0
+;; Version: 0.1.0
 ;; Package-Requires: ((emacs "29.1"))
 
 ;; This file is NOT a part of GNU Emacs.

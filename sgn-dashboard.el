@@ -38,18 +38,21 @@
 
 ;;;; Keymap
 
-(defvar sgn-dashboard-mode-map
-  (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map tabulated-list-mode-map)
-    (define-key map (kbd "RET") #'sgn-dashboard-open)
-    (define-key map (kbd "c") #'sgn-chat)
-    (define-key map (kbd "s") #'sgn-search)
-    (define-key map (kbd "g") #'sgn-dashboard-refresh)
-    (define-key map (kbd "d") #'sgn-dashboard-mark-read)
-    (define-key map (kbd "M") #'sgn-dashboard-toggle-mute)
-    (define-key map (kbd "P") #'sgn-dashboard-toggle-pin)
-    map)
+;; Use `setq' (not `defvar') so reloading this file always installs
+;; the correct bindings, even when an older keymap is already bound.
+(defvar sgn-dashboard-mode-map nil
   "Keymap for `sgn-dashboard-mode'.")
+(setq sgn-dashboard-mode-map
+      (let ((map (make-sparse-keymap)))
+        (set-keymap-parent map tabulated-list-mode-map)
+        (define-key map (kbd "RET") #'sgn-dashboard-open)
+        (define-key map (kbd "c") #'sgn-chat)
+        (define-key map (kbd "s") #'sgn-search)
+        (define-key map (kbd "g") #'sgn-dashboard-refresh)
+        (define-key map (kbd "d") #'sgn-dashboard-mark-read)
+        (define-key map (kbd "M") #'sgn-dashboard-toggle-mute)
+        (define-key map (kbd "P") #'sgn-dashboard-toggle-pin)
+        map))
 
 (declare-function sgn-chat "sgn")
 (declare-function sgn-search "sgn-search")
@@ -89,7 +92,7 @@
 \\{sgn-dashboard-mode-map}"
   (setq tabulated-list-format
         [("" 2 t)                         ; pin/unread indicator
-         ("Chat" 32 t)                    ; chat name
+         ("Chat" 38 t)                    ; chat name
          ("Last message" 42 t)            ; preview
          ("Time" 7 sgn-dashboard--sort-by-time :right-align t)
          ("" 5 t)])                       ; unread count
@@ -141,12 +144,11 @@ Skip chats with empty or missing names."
                       (not (zerop (plist-get chat :pinned)))))
          (last-ts (plist-get chat :last-msg-ts))
          (preview (sgn-dashboard--get-preview id))
-         (chat-type (plist-get chat :type))
          (has-unread (> unread 0))
          ;; Column values
          (col-indicator (sgn-dashboard--make-indicator pinned has-unread))
          (col-name (sgn-dashboard--make-name name has-unread))
-         (col-preview (sgn-dashboard--make-preview preview muted chat-type))
+         (col-preview (sgn-dashboard--make-preview preview muted))
          (col-time (sgn-dashboard--make-time last-ts))
          (col-unread (sgn-dashboard--make-unread unread)))
     (list id (vector col-indicator col-name col-preview col-time col-unread))))
@@ -164,15 +166,11 @@ Skip chats with empty or missing names."
       (propertize name 'face 'sgn-dashboard-name-unread-face)
     name))
 
-(defun sgn-dashboard--make-preview (preview muted chat-type)
-  "Build PREVIEW column.  Append mute icon if MUTED.
-CHAT-TYPE is shown as a dim hint when PREVIEW is nil."
-  (let* ((base (or preview
-                   (propertize (if (equal chat-type "group") "group" "contact")
-                               'face 'shadow)))
-         (text (if preview
-                   (propertize preview 'face 'sgn-dashboard-preview-face)
-                 base)))
+(defun sgn-dashboard--make-preview (preview muted)
+  "Build PREVIEW column.  Append mute icon if MUTED."
+  (let ((text (if preview
+                  (propertize preview 'face 'sgn-dashboard-preview-face)
+                "")))
     (if muted
         (concat text (propertize " 🔇" 'face 'sgn-dashboard-muted-face))
       text)))

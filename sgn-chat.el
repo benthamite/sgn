@@ -177,7 +177,6 @@ Keys: :timestamp :rowid :body")
   (setq-local sgn-chat--input-marker (make-marker))
   (setq-local sgn-chat--prompt-start (make-marker))
   (visual-line-mode 1)
-  (add-hook 'post-command-hook #'sgn-chat--guard-cursor nil t)
   (add-hook 'after-change-functions #'sgn-chat--on-input-change nil t)
   (add-hook 'kill-buffer-hook #'sgn-chat--on-kill nil t))
 
@@ -284,22 +283,10 @@ Keys: :timestamp :rowid :body")
     (goto-char (point-max))
     (insert input-text)))
 
-;;;; Cursor guard
-
-(defun sgn-chat--guard-cursor ()
-  "Ensure cursor stays in the editable input area."
-  (when (and sgn-chat--input-marker
-             (marker-position sgn-chat--input-marker))
-    (let ((limit (marker-position sgn-chat--input-marker)))
-      (when (< (point) limit)
-        ;; Allow message-area commands to work
-        (unless (memq this-command
-                      '(sgn-react sgn-reply sgn-edit sgn-delete
-                        sgn-forward sgn-toggle-pin sgn-copy-text
-                        sgn-load-more-history sgn-chat-cancel-action
-                        sgn-format-reveal-spoiler-at-point
-                        sgn-open-at-point))
-          (goto-char limit))))))
+;;;; Cursor guard — no-op
+;; The message area is protected by `read-only' text properties
+;; (set when messages are rendered).  The cursor moves freely so
+;; that point-based commands (react, reply, etc.) work naturally.
 
 ;;;; Input handling
 
@@ -677,7 +664,10 @@ Handles grouping, headers, body, quotes, reactions, and media."
     (put-text-property start (point) 'sgn-message-ts timestamp)
     (put-text-property start (point) 'sgn-message-sender sender)
     (put-text-property start (point) 'sgn-message-chat-id chat-id)
-    (put-text-property start (point) 'sgn-message-target-author target-author)))
+    (put-text-property start (point) 'sgn-message-target-author target-author)
+    ;; Protect message area from editing (cursor still moves freely)
+    (put-text-property start (point) 'read-only t)
+    (put-text-property start (point) 'rear-nonsticky '(read-only))))
 
 (defun sgn-chat--render-quote (author body)
   "Render a quote block for AUTHOR with BODY."

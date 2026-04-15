@@ -121,7 +121,7 @@ DETACH DATABASE export;" key tmp-db))
   "Build ID mappings from EXPORT-DB.
 Return a plist with:
   :conv-to-chat — hash: Desktop conversation UUID → sgn chat ID
-  :uuid-to-id   — hash: serviceId UUID → phone number or UUID"
+  :uuid-to-id   — hash: any UUID (serviceId or conv-id) → sgn sender ID"
   (let ((conv-to-chat (make-hash-table :test 'equal))
         (uuid-to-id (make-hash-table :test 'equal))
         (rows (sqlite-select export-db
@@ -144,6 +144,8 @@ Return a plist with:
                        ;; Private: prefer e164, fall back to serviceId
                        (e164 e164)
                        (service-id service-id)))
+             ;; Sender ID for messages/reactions: prefer e164
+             (sender-id (or e164 service-id))
              ;; Display name
              (display-name (or (and name (not (string-empty-p name)) name)
                                (and profile-name
@@ -151,14 +153,20 @@ Return a plist with:
                                     profile-name))))
         (when chat-id
           (puthash conv-id chat-id conv-to-chat)
-          ;; Map serviceId → e164 for sender resolution
-          (when (and service-id e164)
-            (puthash service-id e164 uuid-to-id))
+          ;; Map both serviceId AND conv-id → sender ID
+          ;; so reactions (which use conv-id as fromId) resolve too
+          (when sender-id
+            (when service-id
+              (puthash service-id sender-id uuid-to-id))
+            (puthash conv-id sender-id uuid-to-id))
           ;; Upsert chat into sgn DB
           (sgn-db-upsert-chat chat-id
                               :name (or display-name "")
                               :type (if (equal type "group") "group" "individual")
-                              :last-msg-ts active-at))))
+                              :last-msg-ts active-at)
+          ;; Register name in contacts cache for rendering
+          (when (and display-name sender-id)
+            (sgn-contacts-set-name sender-id display-name)))))
     (list :conv-to-chat conv-to-chat
           :uuid-to-id uuid-to-id)))
 

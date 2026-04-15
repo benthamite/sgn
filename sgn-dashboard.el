@@ -206,8 +206,9 @@ Levels 1/2/3 blend foreground toward background at 25%/50%/75%."
 ;;;; Building entries
 
 (defun sgn-dashboard--build-entries ()
-  "Build the tabulated-list entries from the database."
-  (let ((chats (sgn-db-get-chats t)))
+  "Build the tabulated-list entries from the database.
+Only include chats that have at least one stored message."
+  (let ((chats (sgn-db-get-chats)))
     (cl-loop for chat in chats
              for name = (or (plist-get chat :name)
                             (sgn-contacts-get-name (plist-get chat :id)))

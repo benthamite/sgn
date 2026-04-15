@@ -9,13 +9,14 @@
 
 ;;; Commentary:
 
-;; Telega-style root buffer showing all conversations sorted by
-;; recency, with pinned chats on top, unread badges, and last message
-;; preview.
+;; Telega-style root buffer showing all conversations using
+;; `tabulated-list-mode'.  Pinned chats on top, unread badges, last
+;; message preview, mute indicators, and keyboard navigation.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'tabulated-list)
 
 (declare-function sgn--log "sgn")
 (declare-function sgn-db-get-chats "sgn-db")
@@ -26,14 +27,9 @@
 (declare-function sgn-chat-open "sgn-chat")
 (declare-function sgn-contacts-get-name "sgn-contacts")
 (declare-function sgn-contacts-display-sender "sgn-contacts")
-(declare-function sgn-contacts-completing-read "sgn-contacts")
 (declare-function sgn-notify-update "sgn-notify")
 
 (defvar sgn-account)
-
-;;;; Faces (inherit from sgn-notify for consistency)
-
-(defvar sgn-unread-face)
 
 ;;;; Buffer name
 
@@ -44,7 +40,7 @@
 
 (defvar sgn-dashboard-mode-map
   (let ((map (make-sparse-keymap)))
-    (set-keymap-parent map special-mode-map)
+    (set-keymap-parent map tabulated-list-mode-map)
     (define-key map (kbd "RET") #'sgn-dashboard-open)
     (define-key map (kbd "c") #'sgn-chat)
     (define-key map (kbd "s") #'sgn-search)
@@ -52,46 +48,84 @@
     (define-key map (kbd "d") #'sgn-dashboard-mark-read)
     (define-key map (kbd "M") #'sgn-dashboard-toggle-mute)
     (define-key map (kbd "P") #'sgn-dashboard-toggle-pin)
-    (define-key map (kbd "n") #'next-line)
-    (define-key map (kbd "p") #'previous-line)
     map)
   "Keymap for `sgn-dashboard-mode'.")
 
 (declare-function sgn-chat "sgn")
 (declare-function sgn-search "sgn-search")
 
+;;;; Faces
+
+(defface sgn-dashboard-unread-face
+  '((t :inherit warning :weight bold))
+  "Face for unread count in the dashboard."
+  :group 'sgn)
+
+(defface sgn-dashboard-name-unread-face
+  '((t :weight bold))
+  "Face for chat names with unread messages."
+  :group 'sgn)
+
+(defface sgn-dashboard-preview-face
+  '((t :inherit shadow))
+  "Face for message preview text."
+  :group 'sgn)
+
+(defface sgn-dashboard-time-face
+  '((t :inherit shadow))
+  "Face for timestamp column."
+  :group 'sgn)
+
+(defface sgn-dashboard-muted-face
+  '((t :inherit shadow))
+  "Face for muted indicator."
+  :group 'sgn)
+
 ;;;; Major mode
 
-(define-derived-mode sgn-dashboard-mode special-mode "Sgn"
-  "Major mode for the Signal chat list."
+(define-derived-mode sgn-dashboard-mode tabulated-list-mode "Sgn"
+  "Major mode for the Signal chat list.
+
+\\{sgn-dashboard-mode-map}"
+  (setq tabulated-list-format
+        [("" 3 t)                         ; pin/unread indicator
+         ("Name" 25 t)                    ; chat name
+         ("Last message" 40 t)            ; preview
+         ("Time" 8 sgn-dashboard--sort-by-time :right-align t)
+         ("" 6 t)])                       ; unread count
+  (setq tabulated-list-padding 1)
+  (setq tabulated-list-sort-key nil)      ; we sort ourselves
   (setq-local truncate-lines t)
-  (setq-local revert-buffer-function #'sgn-dashboard--revert))
+  (setq-local revert-buffer-function #'sgn-dashboard--revert)
+  (tabulated-list-init-header))
 
 (defun sgn-dashboard--revert (_ignore-auto _noconfirm)
   "Revert function for the dashboard buffer."
   (sgn-dashboard-refresh))
 
-;;;; Drawing
+;;;; Sorting
 
-(defun sgn-dashboard--draw ()
-  "Draw the dashboard content."
-  (let* ((inhibit-read-only t)
-         (chats (sgn-db-get-chats))
-         (line (line-number-at-pos))
-         (col (current-column)))
-    (erase-buffer)
-    (insert (propertize "*Sgn*\n\n" 'face 'bold))
-    (if (null chats)
-        (insert (propertize "  No conversations yet.\n" 'face 'shadow))
-      (dolist (chat chats)
-        (sgn-dashboard--draw-chat chat)))
-    ;; Restore position
-    (goto-char (point-min))
-    (forward-line (1- line))
-    (move-to-column col)))
+(defun sgn-dashboard--sort-by-time (a b)
+  "Sort entries A and B by timestamp (most recent first).
+Pinned chats always come before unpinned."
+  (let ((a-pinned (get-text-property 0 'sgn-pinned (elt (cadr a) 0)))
+        (b-pinned (get-text-property 0 'sgn-pinned (elt (cadr b) 0)))
+        (a-ts (get-text-property 0 'sgn-timestamp (elt (cadr a) 3)))
+        (b-ts (get-text-property 0 'sgn-timestamp (elt (cadr b) 3))))
+    (cond
+     ((and a-pinned (not b-pinned)) t)
+     ((and b-pinned (not a-pinned)) nil)
+     (t (> (or a-ts 0) (or b-ts 0))))))
 
-(defun sgn-dashboard--draw-chat (chat)
-  "Draw a single CHAT entry."
+;;;; Building entries
+
+(defun sgn-dashboard--build-entries ()
+  "Build the tabulated-list entries from the database."
+  (let ((chats (sgn-db-get-chats t)))
+    (mapcar #'sgn-dashboard--chat-to-entry chats)))
+
+(defun sgn-dashboard--chat-to-entry (chat)
+  "Convert a CHAT plist to a tabulated-list entry."
   (let* ((id (plist-get chat :id))
          (name (or (plist-get chat :name)
                    (sgn-contacts-get-name id)))
@@ -102,34 +136,51 @@
                       (not (zerop (plist-get chat :pinned)))))
          (last-ts (plist-get chat :last-msg-ts))
          (preview (sgn-dashboard--get-preview id))
-         (time-str (if last-ts (sgn-dashboard--format-time last-ts) ""))
-         (start (point))
-         ;; Layout: icon + name (padded) + preview (truncated) + time + unread
-         (max-name-width 24)
-         (max-preview-width 30)
-         (padded-name (sgn-dashboard--pad-or-truncate name max-name-width))
-         (padded-preview (sgn-dashboard--pad-or-truncate
-                          (or preview "") max-preview-width))
-         (unread-str (if (> unread 0) (format "(%d)" unread) ""))
-         (icon (cond (pinned "📌 ")
-                     ((> unread 0) " ● ")
-                     (t "   "))))
-    ;; Draw line
-    (insert icon)
-    (if (> unread 0)
-        (insert (propertize padded-name 'face 'bold))
-      (insert padded-name))
-    (insert "  ")
-    (insert (propertize padded-preview 'face 'shadow))
-    (insert "  ")
-    (insert (propertize time-str 'face 'shadow))
-    (when (> unread 0)
-      (insert "  " (propertize unread-str 'face 'sgn-unread-face)))
-    (when muted
-      (insert (propertize " 🔇" 'face 'shadow)))
-    (insert "\n")
-    ;; Properties for commands
-    (put-text-property start (point) 'sgn-dashboard-chat-id id)))
+         (has-unread (> unread 0))
+         ;; Column values
+         (col-indicator (sgn-dashboard--make-indicator pinned has-unread))
+         (col-name (sgn-dashboard--make-name name has-unread))
+         (col-preview (sgn-dashboard--make-preview preview muted))
+         (col-time (sgn-dashboard--make-time last-ts))
+         (col-unread (sgn-dashboard--make-unread unread)))
+    (list id (vector col-indicator col-name col-preview col-time col-unread))))
+
+(defun sgn-dashboard--make-indicator (pinned has-unread)
+  "Build indicator column string for PINNED and HAS-UNREAD state."
+  (let ((str (cond (pinned "📌")
+                   (has-unread " ●")
+                   (t "  "))))
+    (propertize str 'sgn-pinned pinned)))
+
+(defun sgn-dashboard--make-name (name has-unread)
+  "Build NAME column, bold if HAS-UNREAD."
+  (if has-unread
+      (propertize name 'face 'sgn-dashboard-name-unread-face)
+    name))
+
+(defun sgn-dashboard--make-preview (preview muted)
+  "Build PREVIEW column.  Append mute icon if MUTED."
+  (let ((text (propertize (or preview "") 'face 'sgn-dashboard-preview-face)))
+    (if muted
+        (concat text (propertize " 🔇" 'face 'sgn-dashboard-muted-face))
+      text)))
+
+(defun sgn-dashboard--make-time (timestamp-ms)
+  "Build time column from TIMESTAMP-MS."
+  (let ((str (if timestamp-ms
+                 (sgn-dashboard--format-time timestamp-ms)
+               "")))
+    (propertize str
+                'face 'sgn-dashboard-time-face
+                'sgn-timestamp (or timestamp-ms 0))))
+
+(defun sgn-dashboard--make-unread (count)
+  "Build unread COUNT column."
+  (if (> count 0)
+      (propertize (format "(%d)" count) 'face 'sgn-dashboard-unread-face)
+    ""))
+
+;;;; Preview and time formatting
 
 (defun sgn-dashboard--get-preview (chat-id)
   "Get last message preview for CHAT-ID."
@@ -144,22 +195,14 @@
          ((and deleted (not (zerop deleted)))
           "[deleted]")
          (body
-          (let ((text (format "%s: %s" sender-name body)))
-            (if (> (length text) 50)
-                (concat (substring text 0 47) "...")
+          (let ((text (format "%s: %s"
+                              sender-name
+                              (replace-regexp-in-string "\n" " " body))))
+            (if (> (length text) 60)
+                (concat (substring text 0 57) "…")
               text)))
          (t
           (format "%s: [media]" sender-name)))))))
-
-(defun sgn-dashboard--pad-or-truncate (str width)
-  "Pad STR to WIDTH or truncate with ellipsis."
-  (let ((len (length str)))
-    (cond
-     ((> len width)
-      (concat (substring str 0 (- width 3)) "..."))
-     ((< len width)
-      (concat str (make-string (- width len) ?\s)))
-     (t str))))
 
 (defun sgn-dashboard--format-time (timestamp-ms)
   "Format TIMESTAMP-MS for the dashboard."
@@ -185,20 +228,36 @@
     (with-current-buffer buf
       (unless (eq major-mode 'sgn-dashboard-mode)
         (sgn-dashboard-mode))
-      (sgn-dashboard--draw))
+      (sgn-dashboard--populate))
     (switch-to-buffer buf)))
+
+(defun sgn-dashboard--populate ()
+  "Populate the dashboard with current data."
+  (let ((entries (sgn-dashboard--build-entries)))
+    ;; Sort: pinned first, then by timestamp descending
+    (setq entries
+          (sort entries
+                (lambda (a b)
+                  (sgn-dashboard--sort-by-time a b))))
+    (setq tabulated-list-entries entries)
+    (tabulated-list-print t)))
 
 (defun sgn-dashboard-refresh ()
   "Refresh the dashboard."
   (interactive)
-  (when (get-buffer sgn-dashboard--buffer-name)
-    (with-current-buffer sgn-dashboard--buffer-name
-      (sgn-dashboard--draw))))
+  (when-let* ((buf (get-buffer sgn-dashboard--buffer-name)))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (sgn-dashboard--populate)))))
+
+(defun sgn-dashboard--chat-id-at-point ()
+  "Return the chat ID for the entry at point, or nil."
+  (tabulated-list-get-id))
 
 (defun sgn-dashboard-open ()
   "Open the chat at point."
   (interactive)
-  (let ((chat-id (get-text-property (point) 'sgn-dashboard-chat-id)))
+  (let ((chat-id (sgn-dashboard--chat-id-at-point)))
     (if chat-id
         (sgn-chat-open chat-id)
       (user-error "No chat at point"))))
@@ -206,18 +265,18 @@
 (defun sgn-dashboard-mark-read ()
   "Mark the chat at point as read."
   (interactive)
-  (let ((chat-id (get-text-property (point) 'sgn-dashboard-chat-id)))
+  (let ((chat-id (sgn-dashboard--chat-id-at-point)))
     (unless chat-id
       (user-error "No chat at point"))
     (sgn-db-set-unread chat-id 0)
     (sgn-notify-update)
-    (sgn-dashboard--draw)
+    (sgn-dashboard--populate)
     (message "Marked as read.")))
 
 (defun sgn-dashboard-toggle-mute ()
   "Toggle mute on the chat at point."
   (interactive)
-  (let ((chat-id (get-text-property (point) 'sgn-dashboard-chat-id)))
+  (let ((chat-id (sgn-dashboard--chat-id-at-point)))
     (unless chat-id
       (user-error "No chat at point"))
     (let* ((chat (sgn-db-get-chat chat-id))
@@ -225,13 +284,13 @@
                                 (not (zerop (plist-get chat :muted)))))
            (new-muted (if currently-muted 0 1)))
       (sgn-db-upsert-chat chat-id :muted new-muted)
-      (sgn-dashboard--draw)
+      (sgn-dashboard--populate)
       (message (if (zerop new-muted) "Unmuted." "Muted.")))))
 
 (defun sgn-dashboard-toggle-pin ()
   "Toggle pin on the chat at point."
   (interactive)
-  (let ((chat-id (get-text-property (point) 'sgn-dashboard-chat-id)))
+  (let ((chat-id (sgn-dashboard--chat-id-at-point)))
     (unless chat-id
       (user-error "No chat at point"))
     (let* ((chat (sgn-db-get-chat chat-id))
@@ -239,7 +298,7 @@
                                  (not (zerop (plist-get chat :pinned)))))
            (new-pinned (if currently-pinned 0 1)))
       (sgn-db-upsert-chat chat-id :pinned new-pinned)
-      (sgn-dashboard--draw)
+      (sgn-dashboard--populate)
       (message (if (zerop new-pinned) "Unpinned." "Pinned.")))))
 
 (provide 'sgn-dashboard)

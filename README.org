@@ -44,6 +44,8 @@ The package is split into focused modules:
 
 The package has no external Emacs package dependencies --- it uses only built-in libraries.
 
+The development repository is on [[https://github.com/benthamite/sgn][GitHub]].
+
 * User options
 :PROPERTIES:
 :CUSTOM_ID: h:user-options

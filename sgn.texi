@@ -1,0 +1,547 @@
+\input texinfo    @c -*- texinfo -*-
+@c %**start of header
+@setfilename sgn.info
+@settitle sgn: Signal client for Emacs
+@documentencoding UTF-8
+@documentlanguage en
+@c %**end of header
+
+@dircategory Emacs misc features
+@direntry
+* sgn: (sgn).           Signal client for Emacs.
+@end direntry
+
+@finalout
+@titlepage
+@author Pablo Stafforini (@email{pablo@@stafforini.com})
+@end titlepage
+
+@contents
+
+@ifnottex
+@node Top
+@top sgn: Signal client for Emacs
+
+This manual describes the features and customization options for the Emacs Lisp package @samp{sgn}. @*
+
+@end ifnottex
+
+@menu
+* Overview::
+* User options::
+* Commands::
+* Functions::
+* Indices::
+
+@detailmenu
+--- The Detailed Node Listing ---
+
+User options
+
+* Account and program paths::
+* Message display::
+* Media rendering::
+* Messaging behavior::
+* Notifications::
+
+Commands
+
+* Starting and stopping::
+* Opening chats::
+* Sending messages and media::
+* Message actions::
+* Polls::
+* Searching::
+* Dashboard::
+* Group and contact management::
+* Global indicator::
+* Text formatting::
+* Importing from Signal Desktop::
+* Miscellaneous::
+
+Functions
+
+* Contact resolution::
+* Chat buffer management::
+* Database operations::
+* RPC layer::
+* Media rendering: Media rendering (1). 
+* Text formatting: Text formatting (1). 
+* Notification helpers::
+* Mention and poll rendering::
+
+Indices
+
+* Function index::
+* Variable index::
+
+@end detailmenu
+@end menu
+
+@node Overview
+@chapter Overview
+
+@samp{sgn} is a full-featured Signal messenger client for Emacs, designed to replace Signal Desktop for daily use.  It communicates with a running @samp{signal-cli} daemon via JSON-RPC and persists all message history locally in an SQLite database with full-text search. @*
+
+The user experience is modeled after @samp{telega}, the Telegram client for Emacs.  Chat buffers use a header-plus-body grouping style, with text properties on every message enabling point-based commands for reactions, replies, editing, deletion, and more.  A dashboard buffer provides a chat list with unread badges, last-message previews, and pinned chats. @*
+
+The package is split into focused modules: @*
+
+@itemize
+@item
+@samp{sgn.el} --- Entry point, autoloads, and top-level commands. @*
+@item
+@samp{sgn-rpc.el} --- JSON-RPC subprocess management, send/receive, retry logic. @*
+@item
+@samp{sgn-db.el} --- SQLite persistence layer with FTS5 full-text search. @*
+@item
+@samp{sgn-chat.el} --- Chat buffer mode with telega-style rendering and input handling. @*
+@item
+@samp{sgn-actions.el} --- Message actions: react, reply, edit, delete, forward, pin. @*
+@item
+@samp{sgn-contacts.el} --- Contact/group cache and completing-read interface. @*
+@item
+@samp{sgn-media.el} --- Inline images, stickers, voice notes, link previews. @*
+@item
+@samp{sgn-format.el} --- Text formatting: render Signal styles, compose markup. @*
+@item
+@samp{sgn-notify.el} --- Modeline/tab-bar unread indicator and desktop notifications. @*
+@item
+@samp{sgn-search.el} --- FTS5-powered search across conversations. @*
+@item
+@samp{sgn-dashboard.el} --- Chat list buffer with sorting, unread tracking, and fade-out truncation. @*
+@item
+@samp{sgn-import.el} --- One-time import of history from Signal Desktop. @*
+@end itemize
+
+@strong{Prerequisites}: @*
+
+@enumerate
+@item
+Emacs 29.1 or later, compiled with SQLite and FTS5 support. @*
+@item
+@samp{signal-cli} v0.14+ installed and in @code{$PATH}, with a registered or linked Signal account. @*
+@item
+Optional: ImageMagick (@samp{convert}) for animated sticker conversion; @samp{sox} for voice note recording; @samp{sqlcipher} CLI for Signal Desktop import. @*
+@end enumerate
+
+The package has no external Emacs package dependencies --- it uses only built-in libraries. @*
+
+The development repository is on @uref{https://github.com/benthamite/sgn, GitHub}. @*
+
+@node User options
+@chapter User options
+
+@menu
+* Account and program paths::
+* Message display::
+* Media rendering::
+* Messaging behavior::
+* Notifications::
+@end menu
+
+@node Account and program paths
+@section Account and program paths
+
+@vindex sgn-account
+@vindex sgn-cli-program
+@vindex sgn-data-directory
+@vindex sgn-db-directory
+The user option @code{sgn-account} specifies the registered Signal phone number, for example @samp{+15550000000}.  This must match the account registered with @samp{signal-cli}.  The value is required: @code{sgn-start} will signal an error if it is @code{nil}.  The default is @code{nil}. @*
+
+The user option @code{sgn-cli-program} specifies the path to the @samp{signal-cli} executable.  If @samp{signal-cli} is on your @code{$PATH}, the default value (the result of @code{executable-find}) should work without modification. @*
+
+The user option @code{sgn-data-directory} specifies the directory where @samp{signal-cli} stores its data, including attachments and sticker packs.  The default is @samp{~/.local/share/signal-cli}.  You would change this if you installed @samp{signal-cli} with a non-standard data path. @*
+
+The user option @code{sgn-db-directory} specifies the directory where @samp{sgn} stores its SQLite database.  The default is @samp{~/.local/share/sgn}.  The directory is created automatically on first run. @*
+
+@node Message display
+@section Message display
+
+@vindex sgn-history-page-size
+@vindex sgn-message-grouping-interval
+@vindex sgn-timestamp-format
+@vindex sgn-prompt
+The user option @code{sgn-history-page-size} controls how many messages are loaded into a chat buffer when it is first opened.  The default is 50.  Increase this if you want to see more history immediately; decrease it for faster buffer creation. @*
+
+The user option @code{sgn-message-grouping-interval} specifies the number of seconds within which consecutive messages from the same sender are grouped under a single header.  The default is 300 (five minutes).  Set this to 0 to disable grouping entirely, or increase it to group messages over longer spans. @*
+
+The user option @code{sgn-timestamp-format} controls how message timestamps are displayed.  It accepts three values: @code{smart} (the default) shows relative time for recent messages and absolute time for older ones; @code{absolute} always shows the full date and time; @code{relative} always shows relative time (e.g., ``5m'', ``2h''). @*
+
+The user option @code{sgn-prompt} specifies the input prompt string displayed at the bottom of chat buffers.  The default is @samp{"> "}. @*
+
+@node Media rendering
+@section Media rendering
+
+@vindex sgn-image-max-width
+@vindex sgn-sticker-max-width
+@vindex sgn-enable-animation
+The user option @code{sgn-image-max-width} sets the maximum pixel width for inline image rendering in chat buffers.  The default is 300.  Increase this on high-resolution displays or if you want larger image previews. @*
+
+The user option @code{sgn-sticker-max-width} sets the maximum pixel width for sticker images.  The default is 150.  Stickers are typically smaller than photos, so a separate limit keeps them from appearing disproportionately large. @*
+
+The user option @code{sgn-enable-animation} controls whether stickers and GIFs are animated.  The default is @code{t}.  Set this to @code{nil} if animations are distracting or cause performance issues. @*
+
+@node Messaging behavior
+@section Messaging behavior
+
+@vindex sgn-auto-open-buffer
+@vindex sgn-send-read-receipts
+@vindex sgn-cli-auto-read-receipts
+@vindex sgn-send-typing
+The user option @code{sgn-auto-open-buffer} controls whether a chat buffer is automatically displayed when an incoming message arrives.  The default is @code{nil}, meaning new messages only update the unread count and trigger notifications.  Set this to @code{t} if you want Emacs to switch to the relevant chat buffer on each incoming message. @*
+
+The user option @code{sgn-send-read-receipts} controls whether @samp{sgn} sends read receipts via @code{sendReceipt} when a chat buffer is visible and focused.  The default is @code{t}.  This is @emph{focus-gated}: receipts are only sent when you are actually looking at the chat, preserving your privacy when you have a chat buffer open but unfocused. @*
+
+The user option @code{sgn-cli-auto-read-receipts} controls whether the @samp{--send-read-receipts} flag is passed to @samp{signal-cli} at the process level.  The default is @code{nil}.  When enabled, @samp{signal-cli} sends read receipts for @emph{every} incoming data message regardless of Emacs focus.  Most users should leave this off and rely on @code{sgn-send-read-receipts} instead. @*
+
+The user option @code{sgn-send-typing} controls whether typing indicators are sent to your chat partner while you compose a message.  The default is @code{t}. @*
+
+@node Notifications
+@section Notifications
+
+@vindex sgn-notification-style
+@vindex sgn-desktop-notifications
+The user option @code{sgn-notification-style} determines where the global unread count indicator is displayed.  It accepts two values: @code{modeline} (the default) adds a @samp{[sgn:N]} indicator to the global mode line; @code{tab-bar} adds a segment to the tab bar instead.  The indicator is managed by the minor mode @code{sgn-global-mode} (@ref{Global indicator}). @*
+
+The user option @code{sgn-desktop-notifications} controls whether desktop notifications are shown for incoming messages.  The default is @code{t}.  Notifications are suppressed for muted chats.  On macOS, notifications use AppleScript; on Linux, they use D-Bus via @code{notifications-notify}. @*
+
+@node Commands
+@chapter Commands
+
+@menu
+* Starting and stopping::
+* Opening chats::
+* Sending messages and media::
+* Message actions::
+* Polls::
+* Searching::
+* Dashboard::
+* Group and contact management::
+* Global indicator::
+* Text formatting::
+* Importing from Signal Desktop::
+* Miscellaneous::
+@end menu
+
+@node Starting and stopping
+@section Starting and stopping
+
+@findex sgn-start
+@findex sgn-stop
+@findex sgn-show-log
+The command @code{sgn-start} initializes the @samp{sgn} Signal client.  It validates that SQLite and @samp{signal-cli} are available, initializes the database, loads the contact cache, starts the JSON-RPC subprocess, subscribes to incoming messages, refreshes contacts, and enables the global unread indicator.  Call this once at the beginning of your session. @*
+
+The command @code{sgn-stop} shuts down the client.  It stops the JSON-RPC subprocess, cancels all timers (contact refresh, message expiration), closes the database, and disables the global indicator. @*
+
+The command @code{sgn-show-log} displays the @samp{*sgn-log*} debug buffer.  This buffer records all JSON-RPC traffic and internal events, which is useful for troubleshooting connectivity or message delivery issues. @*
+
+@node Opening chats
+@section Opening chats
+
+@findex sgn-chat
+@findex sgn-note-to-self
+@findex sgn-dashboard
+The command @code{sgn-chat} prompts for a recipient using @code{completing-read} over all contacts and groups, sorted by recency.  Each candidate carries a hidden stable chat ID, so selection works correctly even when multiple contacts share a display name.  Annotations show unread counts and relative timestamps. @*
+
+The command @code{sgn-note-to-self} opens the ``Note to Self'' chat, which is the conversation with your own Signal account. @*
+
+The command @code{sgn-dashboard} opens the chat list buffer (@ref{Dashboard}). @*
+
+@node Sending messages and media
+@section Sending messages and media
+
+@findex sgn-chat-send-input
+@findex sgn-attach-file
+@findex sgn-send-voice-note
+The command @code{sgn-chat-send-input} sends the text in the input area to the current chat.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (@samp{*bold*}, @samp{_italic_}, @samp{~strikethrough~}, @samp{`monospace`}, @samp{||spoiler||}) is parsed into Signal style ranges before sending.  Bound to @code{RET} in chat buffers. @*
+
+The command @code{sgn-attach-file} sends a file as an attachment to the current chat.  It prompts for a file path interactively.  Bound to @code{C-c C-a}. @*
+
+The command @code{sgn-send-voice-note} is a placeholder for recording and sending voice notes.  It is not yet implemented. @*
+
+@node Message actions
+@section Message actions
+
+These commands operate on the message at point in a chat buffer.  Point can be anywhere within a message's text property region. @*
+
+@findex sgn-react
+@findex sgn-reply
+@findex sgn-edit
+@findex sgn-delete
+@findex sgn-forward
+@findex sgn-copy-text
+@findex sgn-toggle-pin
+@findex sgn-chat-cancel-action
+The command @code{sgn-react} sends a reaction to the message at point.  It prompts with @code{completing-read} over common emoji (by name, e.g., ``thumbs up'', ``heart'').  You can also type an emoji character directly.  If you have already reacted to the message, invoking @code{sgn-react} again removes your reaction.  Bound to @code{r}. @*
+
+The command @code{sgn-reply} sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press @code{C-g} (@code{sgn-chat-cancel-action}) to cancel.  Bound to @code{q}. @*
+
+The command @code{sgn-edit} places the text of your own message at point into the input area for editing.  Only your own messages can be edited.  The edited text is sent with @code{editTimestamp} so Signal replaces the original.  Press @code{C-g} to cancel.  Bound to @code{e}. @*
+
+The command @code{sgn-delete} performs a remote delete of your own message at point.  It prompts for confirmation with @code{y-or-n-p}.  The message is marked as deleted both locally and for all recipients.  Bound to @code{d}. @*
+
+The command @code{sgn-forward} sends the text of the message at point to another chat selected via @code{completing-read}.  Bound to @code{f}. @*
+
+The command @code{sgn-copy-text} copies the message text at point to the kill ring.  Bound to @code{c}. @*
+
+The command @code{sgn-toggle-pin} pins or unpins the message at point.  If the message is already pinned, it is unpinned; otherwise, it is pinned.  Pinned messages display a pin indicator in the chat buffer.  Bound to @code{P}. @*
+
+The command @code{sgn-chat-cancel-action} cancels an in-progress reply or edit, clearing the input area and restoring the normal prompt.  If no action is in progress, it falls through to @code{keyboard-quit}.  Bound to @code{C-g}. @*
+
+@node Polls
+@section Polls
+
+@findex sgn-create-poll
+@findex sgn-vote-poll
+The command @code{sgn-create-poll} creates a new poll in the current chat.  It prompts for a question and then repeatedly prompts for options until you enter an empty string.  At least two options are required. @*
+
+The command @code{sgn-vote-poll} votes in the poll at point.  It displays the available options via @code{completing-read} and sends the vote to the group. @*
+
+@node Searching
+@section Searching
+
+@findex sgn-search
+@findex sgn-search-in-chat
+@findex sgn-search-refresh
+@findex sgn-search-goto-result
+@findex sgn-search-next-result
+@findex sgn-search-prev-result
+The command @code{sgn-search} performs a full-text search across all conversations using FTS5.  It prompts for a query string and displays results in a @samp{*sgn Search*} buffer.  Each result shows the sender, timestamp, a snippet with highlighted matches, and a link to the source chat.  Deleted messages are excluded. @*
+
+The command @code{sgn-search-in-chat} restricts the search to the current chat buffer. @*
+
+The command @code{sgn-search-refresh} re-runs the most recent search query. @*
+
+In the search results buffer, @code{sgn-search-goto-result} (bound to @code{RET}) opens the chat containing the result at point.  @code{sgn-search-next-result} (@code{n}) and @code{sgn-search-prev-result} (@code{p}) navigate between results. @*
+
+@node Dashboard
+@section Dashboard
+
+@findex sgn-dashboard
+@findex sgn-dashboard-refresh
+@findex sgn-dashboard-open
+@findex sgn-dashboard-mark-read
+@findex sgn-dashboard-toggle-mute
+@findex sgn-dashboard-toggle-pin
+The dashboard is a @code{tabulated-list-mode} buffer named @samp{*sgn*} that displays all conversations sorted by last message timestamp, with pinned chats always at the top.  Each row shows the chat name, a last-message preview, a relative timestamp, and an unread count.  Chats with unread messages are displayed in bold.  Long text is truncated with a fade-out gradient effect instead of an ellipsis. @*
+
+The command @code{sgn-dashboard-open} opens the chat at point.  Bound to @code{RET}. @*
+
+The command @code{sgn-dashboard-mark-read} marks the chat at point as read and resets its unread count.  Bound to @code{d}. @*
+
+The command @code{sgn-dashboard-toggle-mute} mutes or unmutes the chat at point.  Muted chats suppress desktop notifications.  Bound to @code{M}. @*
+
+The command @code{sgn-dashboard-toggle-pin} pins or unpins the chat at point.  Pinned chats are sorted to the top of the list.  Bound to @code{P}. @*
+
+The command @code{sgn-dashboard-refresh} reloads the dashboard data from the database.  Bound to @code{g}.  The dashboard also refreshes automatically when new messages arrive. @*
+
+@node Group and contact management
+@section Group and contact management
+
+@findex sgn-create-group
+@findex sgn-set-disappearing
+@findex sgn-block-contact
+@findex sgn-unblock-contact
+@findex sgn-contacts-refresh
+The command @code{sgn-create-group} creates a new Signal group.  It prompts for a group name and then repeatedly prompts for member phone numbers until you enter an empty string. @*
+
+The command @code{sgn-set-disappearing} sets the disappearing message timer for the current chat.  It prompts for a duration in seconds; entering 0 disables the timer.  The command dispatches to @code{updateGroup} for groups and @code{updateContact} for individual chats. @*
+
+The command @code{sgn-block-contact} blocks a contact after confirmation.  The command @code{sgn-unblock-contact} unblocks a previously blocked contact.  Both prompt for the contact via @code{completing-read}. @*
+
+The command @code{sgn-contacts-refresh} fetches the latest contacts and groups from @samp{signal-cli} and updates both the in-memory cache and the database.  This runs automatically on startup and periodically, but you can invoke it manually if a contact name has not yet updated. @*
+
+@node Global indicator
+@section Global indicator
+
+@findex sgn-global-mode
+The minor mode @code{sgn-global-mode} activates the global unread count indicator.  When enabled, it displays the total unread message count in either the mode line or tab bar, depending on the value of @code{sgn-notification-style} (@ref{Notifications}).  This mode is enabled automatically by @code{sgn-start} and disabled by @code{sgn-stop}. @*
+
+@node Text formatting
+@section Text formatting
+
+@findex sgn-format-reveal-spoiler-at-point
+The command @code{sgn-format-reveal-spoiler-at-point} reveals spoiler text at point.  Spoiler messages arrive with foreground and background colors matched so the text is concealed; this command swaps the face to @code{sgn-spoiler-revealed-face} to make the text readable. @*
+
+@node Importing from Signal Desktop
+@section Importing from Signal Desktop
+
+@findex sgn-import-from-desktop
+The command @code{sgn-import-from-desktop} performs a one-time import of message history from Signal Desktop's SQLCipher database into @samp{sgn}'s SQLite database.  This requires the @samp{sqlcipher} CLI tool (installable via @samp{brew install sqlcipher} on macOS) and a local Signal Desktop installation. @*
+
+The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file, builds conversation and identity mappings, imports all messages with their metadata (quotes, expiration timers, raw JSON), and then imports reactions.  The temporary file is deleted after the import completes. @*
+
+On macOS, the command automatically handles both the legacy plain-text key and the newer Chromium safeStorage encrypted key format, decrypting via the macOS Keychain and Node.js. @*
+
+@node Miscellaneous
+@section Miscellaneous
+
+@findex sgn-open-at-point
+@findex sgn-load-more-history
+The command @code{sgn-open-at-point} opens media or follows a link at point.  If point is on a button (such as an attachment or link preview), it activates it.  Bound to @code{RET} in the message area. @*
+
+The command @code{sgn-load-more-history} loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to @code{g} in chat buffers. @*
+
+@node Functions
+@chapter Functions
+
+@menu
+* Contact resolution::
+* Chat buffer management::
+* Database operations::
+* RPC layer::
+* Media rendering: Media rendering (1). 
+* Text formatting: Text formatting (1). 
+* Notification helpers::
+* Mention and poll rendering::
+@end menu
+
+@node Contact resolution
+@section Contact resolution
+
+@findex sgn-contacts-get-name
+@findex sgn-contacts-set-name
+@findex sgn-contacts-display-sender
+@findex sgn-contacts-completing-read
+@findex sgn-contacts-load-from-db
+The function @code{sgn-contacts-get-name} returns the display name for a Signal ID (phone number or group ID).  If no name is cached, it returns the ID itself as a fallback. @*
+
+The function @code{sgn-contacts-set-name} stores a display name for a Signal ID in the in-memory cache.  This is called automatically when messages arrive with sender name information. @*
+
+The function @code{sgn-contacts-display-sender} returns a display string for a sender.  If SENDER matches @code{sgn-account}, it returns @samp{"You"}; otherwise it resolves the name via @code{sgn-contacts-get-name}. @*
+
+The function @code{sgn-contacts-completing-read} presents a @code{completing-read} interface for selecting a chat.  Candidates are sorted by recency and annotated with unread counts and relative timestamps.  Duplicate display names are disambiguated with a phone number or group ID suffix.  Returns the selected chat ID, not the display name. @*
+
+The function @code{sgn-contacts-load-from-db} loads contact names from the database into the in-memory cache.  Called during startup. @*
+
+@node Chat buffer management
+@section Chat buffer management
+
+@findex sgn-chat-get-buffer
+@findex sgn-chat-open
+@findex sgn-chat-insert-message
+@findex sgn-chat-update-message
+@findex sgn-chat-show-typing
+@findex sgn-chat-clear-typing
+@findex sgn-chat-insert-system-msg
+@findex sgn-chat-message-at-point
+The function @code{sgn-chat-get-buffer} returns the buffer for a given chat ID, creating it if necessary.  Buffer names follow the pattern @samp{*sgn: <display-name>*}.  When a name collision occurs (two different chats with the same display name), a disambiguating suffix is appended. @*
+
+The function @code{sgn-chat-open} opens a chat buffer and switches to it, positioning point at the end and marking the chat as read. @*
+
+The function @code{sgn-chat-insert-message} renders a new incoming or sync message into the appropriate chat buffer.  It inserts before the input prompt and scrolls to the bottom if the buffer is visible. @*
+
+The function @code{sgn-chat-update-message} re-renders a specific message by its ROWID@.  This is used after edits, deletions, or reaction changes to refresh the display. @*
+
+The function @code{sgn-chat-show-typing} displays a typing indicator for a given sender in the header line of the appropriate chat buffer.  The indicator auto-clears after ten seconds. @*
+
+The function @code{sgn-chat-clear-typing} removes the typing indicator from the current buffer's header line. @*
+
+The function @code{sgn-chat-insert-system-msg} inserts a system message (such as an error or status notification) into a chat buffer.  The message is rendered with a configurable face, defaulting to @code{sgn-error-face}. @*
+
+The function @code{sgn-chat-message-at-point} returns a plist describing the message at point, including @code{:rowid}, @code{:timestamp}, @code{:sender}, @code{:chat-id}, and @code{:target-author}.  This is the foundation for all point-based message actions (@ref{Message actions}). @*
+
+@node Database operations
+@section Database operations
+
+@findex sgn-db-init
+@findex sgn-db-close
+@findex sgn-db-search
+@findex sgn-db-purge-expired
+The function @code{sgn-db-init} initializes the SQLite database.  It creates the database directory if needed, verifies FTS5 support, enables WAL journaling, and creates all tables on first run.  Called by @code{sgn-start}. @*
+
+The function @code{sgn-db-close} closes the database connection. @*
+
+The function @code{sgn-db-search} performs a full-text search using FTS5.  It accepts a QUERY string, an optional CHAT-ID to restrict the search, and an optional LIMIT@.  Results include a @code{:snippet} key with highlighted matches delimited by brackets.  Deleted messages are excluded. @*
+
+The function @code{sgn-db-purge-expired} deletes messages whose expiration timestamp has passed.  It runs periodically on a timer started by @code{sgn-start}. @*
+
+@node RPC layer
+@section RPC layer
+
+@findex sgn-rpc-start
+@findex sgn-rpc-stop
+@findex sgn-rpc-alive-p
+@findex sgn-rpc-send
+@findex sgn-rpc-send-message
+The function @code{sgn-rpc-start} starts the @samp{signal-cli} JSON-RPC subprocess.  It resets all internal state and launches the process with a filter and sentinel for handling incoming data. @*
+
+The function @code{sgn-rpc-stop} stops the subprocess. @*
+
+The function @code{sgn-rpc-alive-p} returns non-nil if the subprocess is running. @*
+
+The function @code{sgn-rpc-send} sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay. @*
+
+The function @code{sgn-rpc-send-message} is a convenience wrapper that sends a text message to a chat ID, with optional extras (attachments, quote parameters, edit timestamp). @*
+
+@node Media rendering (1)
+@section Media rendering
+
+@findex sgn-media-insert
+@findex sgn-media-insert-inline-image
+@findex sgn-media-find-sticker
+@findex sgn-media-insert-voice-note
+@findex sgn-media-play-audio
+@findex sgn-media-insert-link-preview
+The function @code{sgn-media-insert} is the main entry point for rendering media in a chat buffer.  It handles both attachments (images, files) and stickers, dispatching to the appropriate rendering function. @*
+
+The function @code{sgn-media-insert-inline-image} creates and inserts an Emacs image object from a file path.  It respects @code{sgn-image-max-width} and animates multi-frame images when @code{sgn-enable-animation} is non-nil. @*
+
+The function @code{sgn-media-find-sticker} locates the local file for a sticker by pack ID and sticker ID@.  It first checks the pack's @samp{manifest.json}, then falls back to searching by numeric ID with common extensions. @*
+
+The function @code{sgn-media-insert-voice-note} inserts a clickable voice note element displaying the duration and a play button. @*
+
+The function @code{sgn-media-play-audio} plays an audio file.  It prefers Emacs's built-in @code{play-sound-file} when available, falling back to external players (@samp{afplay} on macOS, @samp{paplay} or @samp{aplay} on Linux). @*
+
+The function @code{sgn-media-insert-link-preview} renders a box-drawing framed link preview with title, description, domain, and optional thumbnail.  Pressing @code{RET} on the preview opens the URL in a browser. @*
+
+@node Text formatting (1)
+@section Text formatting
+
+@findex sgn-format-apply-styles
+@findex sgn-format-parse-markup
+@findex sgn-format-styles-to-json
+The function @code{sgn-format-apply-styles} applies Signal text style ranges to a string.  It accepts TEXT and a STYLES-JSON string (a JSON array of objects with @code{start}, @code{length}, and @code{style} keys).  The supported styles are BOLD, ITALIC, STRIKETHROUGH, MONOSPACE, and SPOILER, each mapped to an appropriate Emacs face.  Spoiler text additionally receives the @code{sgn-spoiler} text property for use by @code{sgn-format-reveal-spoiler-at-point} (@ref{Text formatting, , Text formatting commands}). @*
+
+The function @code{sgn-format-parse-markup} parses lightweight markup in user input.  It returns a plist with @code{:text} (the plain text with delimiters removed) and @code{:styles} (a list of style alists ready for Signal's API).  The supported markup delimiters are @samp{*bold*}, @samp{_italic_}, @samp{~strikethrough~}, @samp{`monospace`}, and @samp{||spoiler||}.  Backslash-escaped delimiters are treated as literals. @*
+
+The function @code{sgn-format-styles-to-json} serializes a list of style alists into a JSON array string suitable for database storage. @*
+
+@node Notification helpers
+@section Notification helpers
+
+@findex sgn-notify-update
+@findex sgn-notify-message
+The function @code{sgn-notify-update} recalculates the global unread count from the database and updates the modeline or tab-bar indicator.  Muted chats are excluded from the count. @*
+
+The function @code{sgn-notify-message} shows a desktop notification for a new message.  It is suppressed for muted chats.  The notification includes the sender name and a truncated message preview. @*
+
+@node Mention and poll rendering
+@section Mention and poll rendering
+
+@findex sgn-actions-apply-mentions
+@findex sgn-actions-render-poll
+The function @code{sgn-actions-apply-mentions} applies mention highlighting to a text string.  Mentions of self use @code{sgn-mention-self-face}; mentions of others use @code{sgn-mention-face}. @*
+
+The function @code{sgn-actions-render-poll} renders a poll into the current buffer, displaying the question, options with vote bar charts, vote counts, and a voting prompt (or ``Poll closed'' indicator). @*
+
+@node Indices
+@chapter Indices
+
+@menu
+* Function index::
+* Variable index::
+@end menu
+
+@node Function index
+@section Function index
+
+@printindex fn
+
+@node Variable index
+@section Variable index
+
+@printindex vr
+
+@bye

@@ -72,12 +72,35 @@ If SENDER matches `sgn-account', return \"You\"; otherwise resolve name."
   "Populate cache and DB from a listContacts RESULT."
   (let ((contacts (if (vectorp result) (append result nil) result)))
     (dolist (contact contacts)
-      (let ((number (alist-get 'number contact))
-            (name (alist-get 'name contact)))
-        (when (and number name (not (string-empty-p name)))
-          (sgn-contacts-set-name number name)
-          (sgn-db-upsert-chat number :name name :type "individual")))))
+      (let* ((number (sgn-contacts--non-empty-string (alist-get 'number contact)))
+             (uuid (sgn-contacts--non-empty-string (alist-get 'uuid contact)))
+             (name (sgn-contacts--display-name contact))
+             (id (or number uuid)))
+        (when (and id name)
+          (when number (sgn-contacts-set-name number name))
+          (when uuid (sgn-contacts-set-name uuid name))
+          (sgn-db-upsert-chat id :name name :type "individual")))))
   (sgn--log "Contacts refreshed: %d entries" (hash-table-count sgn-contacts--cache)))
+
+(defun sgn-contacts--display-name (contact)
+  "Return best display name for CONTACT plist from listContacts.
+Falls back through saved name, profile name, and username; returns nil
+if no usable name is available."
+  (or (sgn-contacts--non-empty-string (alist-get 'name contact))
+      (sgn-contacts--profile-name (alist-get 'profile contact))
+      (sgn-contacts--non-empty-string (alist-get 'username contact))))
+
+(defun sgn-contacts--profile-name (profile)
+  "Return joined given+family name from PROFILE alist, or nil."
+  (when profile
+    (let ((given (or (alist-get 'givenName profile) ""))
+          (family (or (alist-get 'familyName profile) "")))
+      (sgn-contacts--non-empty-string
+       (string-trim (concat given " " family))))))
+
+(defun sgn-contacts--non-empty-string (s)
+  "Return S if it is a non-empty string, else nil."
+  (and (stringp s) (not (string-empty-p s)) s))
 
 (defun sgn-contacts--populate-groups (result)
   "Populate cache and DB from a listGroups RESULT."

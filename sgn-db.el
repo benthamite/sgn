@@ -61,9 +61,9 @@ Column names are converted to kebab-case keywords."
            nconc (list (sgn-db--column-to-keyword col) val)))
 
 (defun sgn-db--ensure ()
-  "Signal an error if the database connection is not open."
+  "Initialize the database connection if it is not already open."
   (unless sgn-db--connection
-    (error "sgn database not initialized; call `sgn-db-init' first")))
+    (sgn-db-init)))
 
 (defun sgn-db--db-path ()
   "Return the full path to the sgn database file."

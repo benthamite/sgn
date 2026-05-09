@@ -190,6 +190,7 @@ reliably)."
   :lighter nil
   :group 'sgn
   :keymap sgn-global-mode-map
+  (require 'sgn)
   (if sgn-global-mode
       (progn
         (pcase sgn-notification-style

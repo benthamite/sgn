@@ -287,6 +287,7 @@ Return the number of reactions imported."
   "Import message history from Signal Desktop into sgn's database.
 Requires `sqlcipher' CLI and a running Signal Desktop installation."
   (interactive)
+  (require 'sgn)
   (unless sgn-db--connection
     (user-error "sgn database not initialized; run M-x sgn-start first"))
   (message "Exporting Signal Desktop database...")

@@ -308,6 +308,7 @@ Only include chats that have at least one stored message."
 (defun sgn-dashboard ()
   "Open the sgn dashboard."
   (interactive)
+  (require 'sgn)
   (let ((buf (get-buffer-create sgn-dashboard--buffer-name)))
     (with-current-buffer buf
       (unless (eq major-mode 'sgn-dashboard-mode)

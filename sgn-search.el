@@ -55,6 +55,7 @@
   "Search all conversations for QUERY using FTS5.
 Display results in the *sgn Search* buffer."
   (interactive "sSearch: ")
+  (require 'sgn)
   (setq sgn-search--last-query query)
   (let ((results (sgn-db-search query nil 100)))
     (sgn-search--display query results)))
@@ -63,6 +64,7 @@ Display results in the *sgn Search* buffer."
 (defun sgn-search-in-chat (query)
   "Search within the current chat for QUERY."
   (interactive "sSearch in chat: ")
+  (require 'sgn)
   (unless sgn-chat-id
     (user-error "Not in a chat buffer"))
   (setq sgn-search--last-query query)

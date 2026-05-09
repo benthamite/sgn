@@ -88,6 +88,7 @@
   "React to the message at point.
 If you already reacted, removes your reaction instead."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -141,6 +142,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-reply ()
   "Set up a reply to the message at point."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -166,6 +168,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-edit ()
   "Edit your own message at point."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -192,6 +195,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-delete ()
   "Delete your own message at point (remote delete)."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -215,6 +219,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-forward ()
   "Forward the message at point to another chat."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -234,6 +239,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-copy-text ()
   "Copy the text of the message at point to the kill ring."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -251,6 +257,7 @@ If you already reacted, removes your reaction instead."
 (defun sgn-toggle-pin ()
   "Pin or unpin the message at point."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))
@@ -313,6 +320,7 @@ Return propertized TEXT."
 (defun sgn-create-poll ()
   "Create a new poll in the current chat."
   (interactive)
+  (require 'sgn)
   (unless sgn-chat-id
     (user-error "Not in a chat buffer"))
   (let* ((question (read-string "Poll question: "))
@@ -334,6 +342,7 @@ Return propertized TEXT."
 (defun sgn-vote-poll ()
   "Vote in the poll at point."
   (interactive)
+  (require 'sgn)
   (let ((msg (sgn-chat-message-at-point)))
     (unless msg
       (user-error "No message at point"))

@@ -209,6 +209,24 @@
 
 ;;;; Tier 4 — Callback and error machinery
 
+(ert-deftest sgn-test-rpc-send-starts-service-when-down ()
+  "RPC send starts sgn when the service is not running."
+  (sgn-test-with-clean-state
+    (let ((alive nil)
+          (started nil)
+          (sent nil))
+      (cl-letf (((symbol-function 'sgn-rpc-alive-p)
+                 (lambda () alive))
+                ((symbol-function 'sgn-start)
+                 (lambda () (setq started t alive t)))
+                ((symbol-function 'sgn--log) #'ignore)
+                ((symbol-function 'process-send-string)
+                 (lambda (process string) (setq sent (list process string)))))
+        (should (= (sgn-rpc-send "send" '((message . "hi"))) 1))
+        (should started)
+        (should (equal (car sent) sgn-rpc--process-name))
+        (should (string-match-p "\"method\":\"send\"" (cadr sent)))))))
+
 (ert-deftest sgn-test-handle-result-invokes-callback ()
   "Stored callback is invoked with the result value."
   (sgn-test-with-clean-state

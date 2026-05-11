@@ -168,7 +168,7 @@ The command ~sgn-dashboard~ opens the chat list buffer ([[#h:dashboard][Dashboar
 #+findex: sgn-chat-send-input
 #+findex: sgn-attach-file
 #+findex: sgn-send-voice-note
-The command ~sgn-chat-send-input~ sends the text in the input area to the current chat.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (=*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, =||spoiler||=) is parsed into Signal style ranges before sending.  Bound to ~RET~ in chat buffers.
+The command ~sgn-chat-send-input~ sends the text in the input area to the current chat.  If the =sgn= service is not already running, sending starts it before issuing the RPC request.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (=*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, =||spoiler||=) is parsed into Signal style ranges before sending.  Bound to ~RET~ in chat buffers.
 
 The command ~sgn-attach-file~ sends a file as an attachment to the current chat.  It prompts for a file path interactively.  Bound to ~C-c C-a~.
 
@@ -402,7 +402,7 @@ The function ~sgn-rpc-stop~ stops the subprocess.
 
 The function ~sgn-rpc-alive-p~ returns non-nil if the subprocess is running.
 
-The function ~sgn-rpc-send~ sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay.
+The function ~sgn-rpc-send~ sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  If the RPC process is not running, it starts =sgn= before sending the request.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay.
 
 The function ~sgn-rpc-send-message~ is a convenience wrapper that sends a text message to a chat ID, with optional extras (attachments, quote parameters, edit timestamp).
 

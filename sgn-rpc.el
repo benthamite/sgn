@@ -43,6 +43,7 @@
 (require 'cl-lib)
 
 (declare-function sgn--log "sgn")
+(declare-function sgn-start "sgn")
 
 ;; Variables defined in sgn.el, referenced here.
 (defvar sgn-account)
@@ -175,7 +176,7 @@ called with the result value when a successful response arrives.
 The method name is stored alongside the callback so the error
 handler can determine retry eligibility."
   (unless (sgn-rpc-alive-p)
-    (error "sgn service not running.  M-x sgn-start"))
+    (sgn-rpc--ensure-running))
   (let* ((id (cl-incf sgn-rpc--id-counter))
          (req `((jsonrpc . "2.0")
                 (method . ,method)
@@ -189,6 +190,13 @@ handler can determine retry eligibility."
     (sgn--log "SEND: %s" json-str)
     (process-send-string sgn-rpc--process-name (concat json-str "\n"))
     id))
+
+(defun sgn-rpc--ensure-running ()
+  "Start sgn when the RPC process is not running."
+  (sgn--log "sgn service not running; starting before RPC send.")
+  (sgn-start)
+  (unless (sgn-rpc-alive-p)
+    (user-error "sgn service did not start")))
 
 ;;; Process filter and parsing
 

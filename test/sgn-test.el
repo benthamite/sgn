@@ -600,7 +600,17 @@
   (should (equal (sgn-chat--format-duration 3600) "1h"))
   (should (equal (sgn-chat--format-duration 86400) "1d")))
 
-;;;; Tier 10 — Integration: filter → result → callback
+;;;; Tier 10 — Dashboard buffer
+
+(ert-deftest sgn-test-dashboard-chat-id-at-column-edge ()
+  "Dashboard row lookup works when point is before the row property."
+  (with-temp-buffer
+    (insert " ")
+    (insert (propertize "Alice" 'tabulated-list-id "+1555"))
+    (goto-char (point-min))
+    (should (equal (sgn-dashboard--chat-id-at-point) "+1555"))))
+
+;;;; Tier 11 — Integration: filter → result → callback
 
 (ert-deftest sgn-test-filter-to-callback-integration ()
   "Complete flow: filter → dispatch → handle-result → callback."
@@ -618,7 +628,7 @@
       (should (equal (alist-get 'status callback-result) "ok"))
       (should-not (gethash 1 sgn-rpc--pending-callbacks)))))
 
-;;;; Tier 11 — Column to keyword conversion
+;;;; Tier 12 — Column to keyword conversion
 
 (ert-deftest sgn-test-db-column-to-keyword ()
   "SQL column names convert to kebab-case keywords."

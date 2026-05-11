@@ -346,7 +346,22 @@ Only include chats that have at least one stored message."
 
 (defun sgn-dashboard--chat-id-at-point ()
   "Return the chat ID for the entry at point, or nil."
-  (tabulated-list-get-id))
+  (or (tabulated-list-get-id)
+      (sgn-dashboard--chat-id-on-current-line)))
+
+(defun sgn-dashboard--chat-id-on-current-line ()
+  "Return the chat ID for the entry on the current line, or nil."
+  (let ((end (line-end-position))
+        id)
+    (save-excursion
+      (goto-char (line-beginning-position))
+      (while (and (< (point) end) (not id))
+        (setq id (get-text-property (point) 'tabulated-list-id))
+        (unless id
+          (goto-char (or (next-single-property-change
+                          (point) 'tabulated-list-id nil end)
+                         end)))))
+    id))
 
 (defun sgn-dashboard-open ()
   "Open the chat at point."

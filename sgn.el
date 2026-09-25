@@ -243,7 +243,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
                                    (format "attachments/%s" aid)
                                    sgn-data-directory))))
                :file-name (alist-get 'filename att)
-               :is-voice (if (alist-get 'voiceNote att) 1 0)
+               :is-voice (if (eq (alist-get 'voiceNote att) t) 1 0)
                :width (alist-get 'width att)
                :height (alist-get 'height att)))))
     ;; Store sticker as media
@@ -271,8 +271,8 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
   "Handle an incoming REACTION in CHAT-ID from SENDER."
   (let* ((emoji (alist-get 'emoji reaction))
          (target-author (alist-get 'targetAuthor reaction))
-         (target-ts (alist-get 'targetTimestamp reaction))
-         (is-remove (alist-get 'isRemove reaction))
+         (target-ts (alist-get 'targetSentTimestamp reaction))
+         (is-remove (eq (alist-get 'isRemove reaction) t))
          (msg (sgn-db-get-message chat-id target-author target-ts)))
     (when msg
       (let ((rowid (plist-get msg :rowid)))
@@ -358,7 +358,7 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
   "Handle a pin/unpin message in CHAT-ID from SENDER."
   (let* ((target-author (alist-get 'targetAuthor pin-data))
          (target-ts (alist-get 'targetTimestamp pin-data))
-         (is-unpin (alist-get 'isUnpin pin-data))
+         (is-unpin (eq (alist-get 'isUnpin pin-data) t))
          (msg (sgn-db-get-message chat-id target-author target-ts)))
     (when msg
       (let ((rowid (plist-get msg :rowid)))
@@ -389,7 +389,10 @@ ENVELOPE is the full envelope, SYNC is the syncMessage."
          (sticker (and sent (alist-get 'sticker sent)))
          (edit-ts (and sent (alist-get 'editTimestamp sent)))
          (quote-data (and sent (alist-get 'quote sent)))
-         (styles (and sent (alist-get 'textStyles sent))))
+         (styles (and sent (alist-get 'textStyles sent)))
+         (reaction (and sent (alist-get 'reaction sent))))
+    (when (and chat-id reaction)
+      (sgn--handle-incoming-reaction chat-id sgn-account reaction))
     (when (and chat-id (or msg-text attachments sticker))
       ;; Ensure chat exists
       (sgn-db-upsert-chat chat-id

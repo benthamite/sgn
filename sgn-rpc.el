@@ -398,15 +398,17 @@ In jsonRpc mode signal-cli receives messages automatically."
 
 ;;; Convenience functions for specific RPC methods
 
-(defun sgn-rpc-send-message (chat-id text &optional extras)
+(defun sgn-rpc-send-message (chat-id text &optional extras callback)
   "Send TEXT to CHAT-ID.
 EXTRAS is an optional alist of additional parameters (e.g.
-quoteTimestamp, quoteAuthor, editTimestamp, attachments).
+quoteTimestamp, quoteAuthor, editTimestamp, attachments).  If
+CALLBACK is non-nil, it is called with the result, whose
+`timestamp' is the message's Signal timestamp.
 Return the request ID."
   (let ((params (append (sgn-rpc--build-address chat-id)
                         `((message . ,text))
                         extras)))
-    (sgn-rpc-send "send" params)))
+    (sgn-rpc-send "send" params callback)))
 
 (defun sgn-rpc-send-reaction (chat-id emoji target-author target-ts &optional remove)
   "Send reaction EMOJI to message identified by TARGET-AUTHOR and TARGET-TS.

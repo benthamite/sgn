@@ -39,6 +39,7 @@
 (declare-function sgn-notify-update "sgn-notify")
 (declare-function sgn-db-insert-message "sgn-db")
 (declare-function sgn-db-upsert-chat "sgn-db")
+(declare-function sgn-db-update-message "sgn-db")
 (declare-function sgn-db-get-message-by-rowid "sgn-db")
 (declare-function sgn-dashboard-refresh "sgn-dashboard")
 (declare-function sgn-react "sgn-actions")
@@ -372,8 +373,7 @@ that they do not shadow `self-insert-command' in the input area.")
          (styles-json (when styles (sgn-format-styles-to-json styles)))
          (extras (when styles
                    `((textStyle . ,(vconcat styles))))))
-    (sgn-rpc-send-message chat-id plain extras)
-    (sgn-chat--persist-and-render-sent chat-id plain styles-json nil nil nil)))
+    (sgn-chat--send-and-persist chat-id plain extras styles-json nil nil nil)))
 
 (defun sgn-chat--do-send-reply (chat-id text quote-ts quote-author quote-body)
   "Send TEXT as a reply in CHAT-ID."
@@ -386,9 +386,8 @@ that they do not shadow `self-insert-command' in the input area.")
                    (quoteMessage . ,(or quote-body "")))))
     (when styles
       (push `(textStyle . ,(vconcat styles)) extras))
-    (sgn-rpc-send-message chat-id plain extras)
-    (sgn-chat--persist-and-render-sent
-     chat-id plain styles-json quote-ts quote-author quote-body)))
+    (sgn-chat--send-and-persist
+     chat-id plain extras styles-json quote-ts quote-author quote-body)))
 
 (defun sgn-chat--do-send-edit (chat-id text edit-ts)
   "Send edited TEXT for message at EDIT-TS in CHAT-ID."
@@ -399,12 +398,36 @@ that they do not shadow `self-insert-command' in the input area.")
                    `((textStyle . ,(vconcat styles))))))
     (sgn-rpc-send-edit chat-id plain edit-ts extras)))
 
+(defun sgn-chat--send-and-persist (chat-id body extras styles-json
+                                           quote-ts quote-author quote-body)
+  "Send BODY to CHAT-ID with RPC EXTRAS, rendering it optimistically.
+STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and QUOTE-BODY describe the
+message.  Once signal-cli replies, the stored timestamp is replaced
+by the one Signal assigned, which other clients use to refer to the
+message in reactions, quotes, edits, and deletes."
+  (let ((rowid (sgn-chat--persist-and-render-sent
+                chat-id body styles-json quote-ts quote-author quote-body)))
+    (sgn-rpc-send-message
+     chat-id body extras
+     (lambda (result)
+       (when-let* ((rowid rowid)
+                   (timestamp (alist-get 'timestamp result)))
+         (sgn-chat--set-sent-timestamp chat-id rowid timestamp))))))
+
+(defun sgn-chat--set-sent-timestamp (chat-id rowid timestamp)
+  "Record Signal TIMESTAMP for sent message ROWID in CHAT-ID."
+  (sgn-db-update-message rowid (list :timestamp timestamp))
+  (when-let* ((buf (get-buffer
+                    (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
+    (with-current-buffer buf
+      (sgn-chat-update-message rowid))))
+
 (defun sgn-chat--persist-and-render-sent (chat-id body styles-json
                                                    quote-ts quote-author
                                                    quote-body)
   "Persist and render a sent message optimistically.
 CHAT-ID, BODY, STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and
-QUOTE-BODY describe the message."
+QUOTE-BODY describe the message.  Return the new rowid."
   (let* ((timestamp (truncate (* (float-time) 1000)))
          (rowid (sgn-db-insert-message
                  (list :chat-id chat-id
@@ -421,7 +444,8 @@ QUOTE-BODY describe the message."
       (let ((msg (sgn-db-get-message-by-rowid rowid)))
         (when msg
           (sgn-chat-insert-message msg))))
-    (sgn-dashboard-refresh)))
+    (sgn-dashboard-refresh)
+    rowid))
 
 ;;;; Cancel reply/edit
 

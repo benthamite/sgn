@@ -301,7 +301,7 @@ These commands operate on the message at point in a chat buffer.  Point can be a
 
 @vindex sgn-chat-message-map
 The single-key bindings below live in @code{sgn-chat-message-map}@comma{} which is attached to each rendered message through the @samp{keymap} text property.  They are active only when point is on a message; in the input area the same keys insert text. @*
-The command @code{sgn-react} sends a reaction to the message at point.  It prompts with @code{completing-read} over common emoji (by name@comma{} e.g.@comma{} ``thumbs up''@comma{} ``heart'').  You can also type an emoji character directly.  If you have already reacted to the message@comma{} invoking @code{sgn-react} again removes your reaction.  Bound to @code{R}. @*
+The command @code{sgn-react} sends a reaction to the message at point.  It prompts with @code{completing-read} over common emoji (by name@comma{} e.g.@comma{} ``thumbs up''@comma{} ``heart'').  You can also type an emoji character directly.  If you have already reacted to the message@comma{} invoking @code{sgn-react} again removes your reaction.  Bound to @code{R}.  Reactions from contacts@comma{} and those you send from your other linked devices@comma{} appear under the message as they arrive. @*
 
 The command @code{sgn-reply} sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press @code{C-g} (@code{sgn-chat-cancel-action}) to cancel.  Bound to @code{r}. @*
 

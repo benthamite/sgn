@@ -440,7 +440,8 @@ reverses to produce chronological order."
       (sgn-db--row-to-plist row sgn-db--message-columns))))
 
 (defconst sgn-db--message-updatable-attrs
-  '((:body . "body")
+  '((:timestamp . "timestamp")
+    (:body . "body")
     (:edited-at . "edited_at")
     (:deleted . "deleted")
     (:expires-in . "expires_in")
@@ -451,8 +452,8 @@ reverses to produce chronological order."
 
 (defun sgn-db-update-message (rowid attrs)
   "Update message ROWID with ATTRS plist.
-ATTRS keys: :body :edited-at :deleted :expires-in :expire-started-at
-:expires-at :styles-json."
+ATTRS keys: :timestamp :body :edited-at :deleted :expires-in
+:expire-started-at :expires-at :styles-json."
   (sgn-db--ensure)
   (let ((provided (sgn-db--extract-provided-attrs attrs sgn-db--message-updatable-attrs)))
     (when provided

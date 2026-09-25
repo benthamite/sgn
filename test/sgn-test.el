@@ -694,6 +694,67 @@
                (save-excursion (goto-char (point-min)) (search-forward "new"))
                (marker-position sgn-chat--prompt-start)))))
 
+(defun sgn-test--receive (json)
+  "Feed the signal-cli receive notification JSON to `sgn--handle-receive'."
+  (sgn--handle-receive (alist-get 'params (json-read-from-string json))))
+
+(ert-deftest sgn-test-incoming-reaction-is-stored-and-rendered ()
+  "A reaction from a contact, in signal-cli's JSON shape, reaches the chat."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (cl-letf (((symbol-function 'sgn-dashboard-refresh) #'ignore)
+              ((symbol-function 'sgn-notify-update) #'ignore))
+      (sgn-db-upsert-chat "+15551234567" :type "individual")
+      (let ((rowid (sgn-db-insert-message
+                    (list :chat-id "+15551234567" :sender sgn-account
+                          :timestamp 1790339121167 :body "mine" :type "sync"))))
+        (let ((inhibit-read-only t))
+          (save-excursion
+            (goto-char (marker-position sgn-chat--prompt-start))
+            (sgn-chat--render-message (sgn-db-get-message-by-rowid rowid))))
+        (sgn-test--receive "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+15551234567\",\"sourceNumber\":\"+15551234567\",\"timestamp\":1790339180639,\"dataMessage\":{\"timestamp\":1790339180639,\"message\":null,\"reaction\":{\"emoji\":\"👍\",\"targetAuthor\":\"+15550000000\",\"targetAuthorNumber\":\"+15550000000\",\"targetSentTimestamp\":1790339121167,\"isRemove\":false}}},\"account\":\"+15550000000\"}}")
+        (should (equal (mapcar (lambda (r) (plist-get r :emoji))
+                               (sgn-db-get-reactions rowid))
+                       '("👍")))
+        (should (string-match-p "👍" (buffer-string)))))))
+
+(ert-deftest sgn-test-sync-reaction-is-stored ()
+  "A reaction sent from another of our devices is recorded."
+  (sgn-test-with-db
+    (cl-letf (((symbol-function 'sgn-dashboard-refresh) #'ignore))
+      (let ((sgn-account "+15550000000"))
+        (sgn-db-upsert-chat "+15551234567" :type "individual")
+        (let ((rowid (sgn-db-insert-message
+                      (list :chat-id "+15551234567" :sender "+15551234567"
+                            :timestamp 1000 :body "theirs" :type "data"))))
+          (sgn-test--receive "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+15550000000\",\"sourceNumber\":\"+15550000000\",\"timestamp\":2000,\"syncMessage\":{\"sentMessage\":{\"destinationNumber\":\"+15551234567\",\"timestamp\":2000,\"message\":null,\"reaction\":{\"emoji\":\"❤️\",\"targetAuthorNumber\":\"+15551234567\",\"targetAuthor\":\"+15551234567\",\"targetSentTimestamp\":1000,\"isRemove\":false}}}}}}")
+          (should (equal (mapcar (lambda (r) (plist-get r :sender))
+                                 (sgn-db-get-reactions rowid))
+                         '("+15550000000"))))))))
+
+(ert-deftest sgn-test-sent-message-takes-signal-timestamp ()
+  "A message sent from sgn is stored under the timestamp Signal assigned."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (cl-letf (((symbol-function 'sgn-dashboard-refresh) #'ignore)
+              ((symbol-function 'sgn-rpc-alive-p) (lambda () t))
+              ((symbol-function 'sgn--log) #'ignore)
+              ((symbol-function 'process-send-string) #'ignore))
+      (sgn-db-upsert-chat "+15551234567" :type "individual")
+      (sgn-chat--do-send "+15551234567" "hello")
+      (let ((rowid (get-text-property
+                    (text-property-not-all (point-min) (point-max)
+                                           'sgn-message-rowid nil)
+                    'sgn-message-rowid)))
+        (sgn-rpc--dispatch
+         (json-read-from-string
+          "{\"jsonrpc\":\"2.0\",\"result\":{\"timestamp\":1790339121167,\"results\":[]},\"id\":1}"))
+        (should (= (plist-get (sgn-db-get-message-by-rowid rowid) :timestamp)
+                   1790339121167))
+        (should (= (get-text-property
+                    (text-property-any (point-min) (point-max)
+                                       'sgn-message-rowid rowid)
+                    'sgn-message-ts)
+                   1790339121167))))))
+
 (ert-deftest sgn-test-chat-timestamp-format-smart ()
   "Smart timestamp shows time for today's messages."
   (let ((sgn-timestamp-format 'smart)

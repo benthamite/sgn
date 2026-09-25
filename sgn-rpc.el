@@ -119,6 +119,16 @@ Prevents infinite retry loops: each request is retried at most once.")
 The process filter accumulates data here until a complete
 newline-terminated JSON object is available for parsing.")
 
+(defvar sgn-rpc--last-output nil
+  "Most recent non-JSON line printed by signal-cli.
+signal-cli reports fatal errors, such as an unregistered account,
+as plain text before exiting.")
+
+(defvar sgn-rpc--failure nil
+  "Description of the last abnormal exit of signal-cli, or nil.
+While non-nil, `sgn-rpc-send' signals this failure instead of
+restarting the process.  `sgn-rpc-start' clears it.")
+
 ;;; Lifecycle
 
 (defun sgn-rpc-start ()
@@ -137,6 +147,8 @@ mode, signal-cli receives messages automatically."
     (delete-process sgn-rpc--process-name))
   ;; Reset all state.
   (setq sgn-rpc--partial-line "")
+  (setq sgn-rpc--last-output nil)
+  (setq sgn-rpc--failure nil)
   (clrhash sgn-rpc--pending-callbacks)
   (clrhash sgn-rpc--request-methods)
   (clrhash sgn-rpc--request-params)
@@ -192,7 +204,12 @@ handler can determine retry eligibility."
     id))
 
 (defun sgn-rpc--ensure-running ()
-  "Start sgn when the RPC process is not running."
+  "Start sgn when the RPC process is not running.
+If signal-cli exited abnormally, signal that failure instead: a
+restart would fail the same way, and `sgn-start' schedules RPC
+sends of its own, so restarting here would loop."
+  (when sgn-rpc--failure
+    (user-error "%s (fix it, then run M-x sgn-start)" sgn-rpc--failure))
   (sgn--log "sgn service not running; starting before RPC send.")
   (sgn-start)
   (unless (sgn-rpc-alive-p)
@@ -219,19 +236,33 @@ buffer exceeds `sgn-rpc--max-partial-line-length'."
       (setq lines (butlast lines)))
     (dolist (line lines)
       (setq line (string-trim line))
-      (when (and (not (string-empty-p line))
-                 (string-prefix-p "{" line))
+      (cond
+       ((string-empty-p line))
+       ((string-prefix-p "{" line)
         (sgn--log "RECV: %s" line)
         (condition-case err
             (let ((json (json-read-from-string line)))
               (sgn-rpc--dispatch json))
-          (error (sgn--log "JSON parse error: %s" err)))))))
+          (error (sgn--log "JSON parse error: %s" err))))
+       (t
+        (setq sgn-rpc--last-output line)
+        (sgn--log "OUTPUT: %s" line))))))
 
 (defun sgn-rpc--process-sentinel (_proc event)
-  "Log process EVENT for debugging."
+  "Log process EVENT and report abnormal exits.
+An abnormal exit is recorded in `sgn-rpc--failure', together with
+the last text signal-cli printed."
   (sgn--log "Process event: %s" (string-trim event))
-  (when (string-prefix-p "exited" event)
-    (message "sgn process exited.")))
+  (cond
+   ((string-prefix-p "exited abnormally" event)
+    (setq sgn-rpc--failure
+          (format "signal-cli %s%s" (string-trim event)
+                  (if sgn-rpc--last-output
+                      (format ": %s" sgn-rpc--last-output)
+                    "")))
+    (message "sgn: %s" sgn-rpc--failure))
+   ((string-prefix-p "exited" event)
+    (message "sgn process exited."))))
 
 ;;; Dispatch
 

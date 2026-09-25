@@ -402,7 +402,7 @@ The function ~sgn-rpc-stop~ stops the subprocess.
 
 The function ~sgn-rpc-alive-p~ returns non-nil if the subprocess is running.
 
-The function ~sgn-rpc-send~ sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  If the RPC process is not running, it starts =sgn= before sending the request.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay.
+The function ~sgn-rpc-send~ sends a generic JSON-RPC request.  It accepts a METHOD name, PARAMS alist, and optional CALLBACK function.  If the RPC process is not running, it starts =sgn= before sending the request, unless signal-cli last exited abnormally: it then signals that failure, including the last text signal-cli printed (for example, that the account is not registered), until ~sgn-start~ is run again.  The callback is invoked with the result when a successful response arrives.  Transient errors on idempotent methods (send, sendReaction, sendReceipt, sendTyping) are automatically retried once after a short delay.
 
 The function ~sgn-rpc-send-message~ is a convenience wrapper that sends a text message to a chat ID, with optional extras (attachments, quote parameters, edit timestamp).
 

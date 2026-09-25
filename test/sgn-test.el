@@ -18,6 +18,8 @@
   "Run BODY with all sgn mutable state reset to fresh defaults."
   (declare (indent 0) (debug body))
   `(let ((sgn-rpc--partial-line "")
+         (sgn-rpc--last-output nil)
+         (sgn-rpc--failure nil)
          (sgn-rpc--id-counter 0)
          (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
          (sgn-rpc--request-methods (make-hash-table :test 'equal))
@@ -226,6 +228,26 @@
         (should started)
         (should (equal (car sent) sgn-rpc--process-name))
         (should (string-match-p "\"method\":\"send\"" (cadr sent)))))))
+
+(ert-deftest sgn-test-abnormal-exit-reports-output-and-stops-restarts ()
+  "An abnormal exit is reported with signal-cli's text and not restarted."
+  (sgn-test-with-clean-state
+    (let ((started nil))
+      (cl-letf (((symbol-function 'sgn-rpc-alive-p) #'ignore)
+                ((symbol-function 'sgn-start)
+                 (lambda () (setq started t)))
+                ((symbol-function 'sgn--log) #'ignore)
+                ((symbol-function 'message) #'ignore))
+        (sgn-rpc--process-filter
+         nil "User +15550000000 is not registered.\n")
+        (sgn-rpc--process-sentinel nil "exited abnormally with code 1\n")
+        (should (equal sgn-rpc--failure
+                       (concat "signal-cli exited abnormally with code 1: "
+                               "User +15550000000 is not registered.")))
+        (let ((err (should-error (sgn-rpc-send "listContacts" nil)
+                                 :type 'user-error)))
+          (should (string-match-p "not registered" (cadr err))))
+        (should-not started)))))
 
 (ert-deftest sgn-test-handle-result-invokes-callback ()
   "Stored callback is invoked with the result value."

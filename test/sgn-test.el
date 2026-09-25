@@ -657,6 +657,22 @@
     (insert "hello world")
     (should (equal (sgn-chat--get-input-text) "hello world"))))
 
+(ert-deftest sgn-test-chat-message-keys-only-on-messages ()
+  "Single-key commands apply on messages but self-insert in the input area."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (let ((inhibit-read-only t))
+      (goto-char (marker-position sgn-chat--prompt-start))
+      (sgn-chat--render-message
+       (list :rowid 1 :sender "+15551234567" :timestamp 1700000000000
+             :chat-id "+15551234567" :body "hello")))
+    (goto-char (point-min))
+    (should (eq (key-binding "r") #'sgn-react))
+    (goto-char (point-max))
+    (should (eq (key-binding "r") #'self-insert-command))
+    (set-window-buffer (selected-window) (current-buffer))
+    (execute-kbd-macro "red")
+    (should (equal (sgn-chat--get-input-text) "red"))))
+
 (ert-deftest sgn-test-chat-timestamp-format-smart ()
   "Smart timestamp shows time for today's messages."
   (let ((sgn-timestamp-format 'smart)

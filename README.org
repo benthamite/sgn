@@ -213,6 +213,9 @@ These commands operate on the message at point in a chat buffer.  Point can be a
 #+findex: sgn-copy-text
 #+findex: sgn-toggle-pin
 #+findex: sgn-chat-cancel-action
+
+#+vindex: sgn-chat-message-map
+The single-key bindings below live in ~sgn-chat-message-map~, which is attached to each rendered message through the =keymap= text property.  They are active only when point is on a message; in the input area the same keys insert text.
 The command ~sgn-react~ sends a reaction to the message at point.  It prompts with ~completing-read~ over common emoji (by name, e.g., "thumbs up", "heart").  You can also type an emoji character directly.  If you have already reacted to the message, invoking ~sgn-react~ again removes your reaction.  Bound to ~r~.
 
 The command ~sgn-reply~ sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press ~C-g~ (~sgn-chat-cancel-action~) to cancel.  Bound to ~q~.
@@ -337,7 +340,7 @@ On macOS, the command automatically handles both the legacy plain-text key and t
 #+findex: sgn-load-more-history
 The command ~sgn-open-at-point~ opens media or follows a link at point.  If point is on a button (such as an attachment or link preview), it activates it.  Bound to ~RET~ in the message area.
 
-The command ~sgn-load-more-history~ loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to ~g~ in chat buffers.
+The command ~sgn-load-more-history~ loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to ~g~ on messages in chat buffers.
 
 * Functions
 :PROPERTIES:

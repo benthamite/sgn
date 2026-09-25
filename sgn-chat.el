@@ -174,6 +174,15 @@ Keys: :timestamp :rowid :body")
         (define-key map (kbd "C-c C-a") #'sgn-attach-file)
         (define-key map (kbd "C-c C-v") #'sgn-send-voice-note)
         (define-key map (kbd "C-g") #'sgn-chat-cancel-action)
+        map))
+
+(defvar sgn-chat-message-map nil
+  "Keymap active on rendered messages, via the `keymap' text property.
+Single-key commands live here rather than in `sgn-chat-mode-map' so
+that they do not shadow `self-insert-command' in the input area.")
+
+(setq sgn-chat-message-map
+      (let ((map (make-sparse-keymap)))
         (define-key map (kbd "r") #'sgn-react)
         (define-key map (kbd "q") #'sgn-reply)
         (define-key map (kbd "e") #'sgn-edit)
@@ -595,7 +604,9 @@ Handles grouping, headers, body, quotes, reactions, and media."
     ;; Header (if not grouped)
     (when need-header
       (sgn-chat--render-header sender timestamp)
-      (put-text-property start (point) 'sgn-message-header t))
+      (put-text-property start (point) 'sgn-message-header t)
+      (put-text-property start (point) 'keymap sgn-chat-message-map)
+      (put-text-property start (point) 'rear-nonsticky '(keymap)))
     ;; Body
     (sgn-chat--render-message-body msg)
     ;; Update grouping state
@@ -697,7 +708,8 @@ Handles grouping, headers, body, quotes, reactions, and media."
     (put-text-property start (point) 'sgn-message-target-author target-author)
     ;; Protect message area from editing (cursor still moves freely)
     (put-text-property start (point) 'read-only t)
-    (put-text-property start (point) 'rear-nonsticky '(read-only))))
+    (put-text-property start (point) 'keymap sgn-chat-message-map)
+    (put-text-property start (point) 'rear-nonsticky '(read-only keymap))))
 
 (defun sgn-chat--render-quote (author body)
   "Render a quote block for AUTHOR with BODY."

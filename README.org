@@ -273,7 +273,7 @@ In the search results buffer, ~sgn-search-goto-result~ (bound to ~RET~) opens th
 #+findex: sgn-dashboard-mark-read
 #+findex: sgn-dashboard-toggle-mute
 #+findex: sgn-dashboard-toggle-pin
-The dashboard is a ~tabulated-list-mode~ buffer named =*sgn*= that displays all conversations sorted by last message timestamp, with pinned chats always at the top.  Each row shows the chat name, a last-message preview, a relative timestamp, and an unread count.  Chats with unread messages are displayed in bold.  Long text is truncated with a fade-out gradient effect instead of an ellipsis.
+The dashboard is a ~tabulated-list-mode~ buffer named =*sgn*= that displays all conversations sorted by last message timestamp, with pinned chats always at the top.  Each row shows the chat name, a last-message preview, a relative timestamp, and an unread count.  Chats with unread messages are displayed in bold.  Long text is truncated with a fade-out gradient effect instead of an ellipsis.  The columns fill the window width: the chat name takes about a third of the space, between 20 and 40 columns, and the preview takes the rest.  They are resized whenever the window is.
 
 The command ~sgn-dashboard-open~ opens the chat at point.  Bound to ~RET~.
 

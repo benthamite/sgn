@@ -175,23 +175,73 @@ Levels 1/2/3 blend foreground toward background at 25%/50%/75%."
                       (push ov sgn-dashboard--fade-overlays))))
                 (setq pos (1+ pos))))))))))
 
+;;;; Column layout
+
+(defconst sgn-dashboard--time-width 7
+  "Width of the time column.")
+
+(defconst sgn-dashboard--unread-width 5
+  "Width of the unread count column.")
+
+(defvar-local sgn-dashboard--name-width 38
+  "Width of the chat name column, set from the window width.")
+
+(defvar-local sgn-dashboard--preview-width 42
+  "Width of the preview column, set from the window width.")
+
+(defun sgn-dashboard--column-widths (window-width)
+  "Return (NAME-WIDTH PREVIEW-WIDTH) filling WINDOW-WIDTH columns.
+The name column takes about a third of the flexible space, within
+20 to 40 columns; the preview takes the rest."
+  ;; Padding, one separator after each of the first three columns, the
+  ;; fixed columns, and one spare column so rows never wrap.
+  (let* ((fixed (+ 1 3 sgn-dashboard--time-width sgn-dashboard--unread-width 1))
+         (flexible (max 40 (- window-width fixed)))
+         (name (min 40 (max 20 (/ flexible 3)))))
+    (list name (- flexible name))))
+
+(defun sgn-dashboard--set-columns (window-width)
+  "Size the columns to fill WINDOW-WIDTH.  Return non-nil if they changed."
+  (pcase-let ((`(,name ,preview) (sgn-dashboard--column-widths window-width)))
+    (unless (and (= name sgn-dashboard--name-width)
+                 (= preview sgn-dashboard--preview-width)
+                 tabulated-list-format)
+      (setq sgn-dashboard--name-width name
+            sgn-dashboard--preview-width preview)
+      (setq tabulated-list-format
+            (vector (list "Chat" name t)
+                    (list "Last message" preview t)
+                    (list "Time" sgn-dashboard--time-width t :right-align t)
+                    (list "" sgn-dashboard--unread-width t)))
+      (tabulated-list-init-header)
+      t)))
+
+(defun sgn-dashboard--window-width ()
+  "Return the body width of the window showing the dashboard."
+  (window-body-width (or (get-buffer-window (current-buffer) t)
+                         (selected-window))))
+
+(defun sgn-dashboard--on-window-change (window)
+  "Refill the columns if WINDOW's width no longer matches them."
+  (with-current-buffer (window-buffer window)
+    (when (sgn-dashboard--set-columns (window-body-width window))
+      (sgn-dashboard--populate))))
+
 ;;;; Major mode
 
 (define-derived-mode sgn-dashboard-mode tabulated-list-mode "sgn"
   "Major mode for the Signal chat list.
 
 \\{sgn-dashboard-mode-map}"
-  (setq tabulated-list-format
-        [("Chat" 38 t)                    ; chat name
-         ("Last message" 42 t)            ; preview
-         ("Time" 7 t :right-align t)      ; timestamp
-         ("" 5 t)])                       ; unread count
+  (setq tabulated-list-format nil)
   (setq tabulated-list-padding 1)
   (setq tabulated-list-sort-key nil)
   (setq-local truncate-lines t)
   (setq-local truncate-string-ellipsis "")
   (setq-local revert-buffer-function #'sgn-dashboard--revert)
-  (tabulated-list-init-header))
+  (add-hook 'window-size-change-functions #'sgn-dashboard--on-window-change nil t)
+  (add-hook 'window-buffer-change-functions #'sgn-dashboard--on-window-change nil t)
+  (sgn-dashboard--set-columns (sgn-dashboard--window-width)))
 
 (defun sgn-dashboard--revert (_ignore-auto _noconfirm)
   "Revert function for the dashboard buffer."
@@ -246,13 +296,16 @@ Only include chats that have at least one stored message."
          (face (if has-unread
                    'sgn-dashboard-name-unread-face
                  'sgn-dashboard-name-face)))
-    (propertize (sgn-dashboard--truncate display 37 face)
+    (propertize (sgn-dashboard--truncate
+                 display (1- sgn-dashboard--name-width) face)
                 'sgn-pinned pinned)))
 
 (defun sgn-dashboard--make-preview (preview muted)
   "Build PREVIEW column with face and fade truncation."
   (let ((text (if preview
-                  (sgn-dashboard--truncate preview 41 'sgn-dashboard-preview-face)
+                  (sgn-dashboard--truncate
+                   preview (1- sgn-dashboard--preview-width)
+                   'sgn-dashboard-preview-face)
                 "")))
     (if muted
         (concat text (propertize " 🔇" 'face 'sgn-dashboard-muted-face))
@@ -324,6 +377,7 @@ Only include chats that have at least one stored message."
 
 (defun sgn-dashboard--populate ()
   "Populate the dashboard with current data."
+  (sgn-dashboard--set-columns (sgn-dashboard--window-width))
   (let ((entries (sgn-dashboard--build-entries)))
     (setq entries
           (sort entries

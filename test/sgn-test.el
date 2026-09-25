@@ -855,6 +855,36 @@
     (goto-char (point-min))
     (should (equal (sgn-dashboard--chat-id-at-point) "+1555"))))
 
+(ert-deftest sgn-test-dashboard-column-widths-fill-window ()
+  "Columns grow with the window; the name column stays within 20–40."
+  (should (equal (sgn-dashboard--column-widths 200) '(40 143)))
+  (should (equal (sgn-dashboard--column-widths 80) '(21 42)))
+  (should (equal (sgn-dashboard--column-widths 30) '(20 20))))
+
+(ert-deftest sgn-test-dashboard-rows-fill-window ()
+  "A long preview extends the row to the window's right edge."
+  (sgn-test-with-db
+    (cl-letf (((symbol-function 'sgn-rpc-failure-advice) #'ignore))
+      (let ((sgn-account "+15550000000"))
+        (sgn-db-upsert-chat "+1555" :name "Alice" :type "individual"
+                            :last-msg-ts 1000)
+        (sgn-db-insert-message
+         (list :chat-id "+1555" :sender "+1555" :timestamp 1000
+               :body (make-string 300 ?x) :type "data"))
+        (unwind-protect
+            (progn
+              (sgn-dashboard)
+              (let ((width (window-body-width)))
+                (goto-char (point-min))
+                (search-forward "Alice")
+                (should (= (string-width
+                            (buffer-substring (line-beginning-position)
+                                              (line-end-position)))
+                           ;; Everything but the empty unread column
+                           ;; and the spare column.
+                           (- width 1 sgn-dashboard--unread-width)))))
+          (kill-buffer sgn-dashboard--buffer-name))))))
+
 ;;;; Tier 11 — Integration: filter → result → callback
 
 (ert-deftest sgn-test-filter-to-callback-integration ()

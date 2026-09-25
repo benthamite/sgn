@@ -154,6 +154,13 @@ Keys: :timestamp :rowid :body")
 (defvar-local sgn-chat--typing-timer nil
   "Timer for sending typing stop indicator.")
 
+(defvar-local sgn-chat--typing-sent-at nil
+  "Time the last typing start indicator was sent, or nil when idle.")
+
+(defconst sgn-chat--typing-refresh-interval 10
+  "Seconds between typing start indicators while typing continues.
+Recipients drop the indicator after about 15 seconds without one.")
+
 (defvar-local sgn-chat--typing-indicator nil
   "String currently shown as typing indicator, or nil.")
 
@@ -482,18 +489,29 @@ Sends typing indicators."
              (marker-position sgn-chat--input-marker)
              (>= beg (marker-position sgn-chat--input-marker))
              (sgn-rpc-alive-p))
-    ;; Send typing start
-    (sgn-rpc-send-typing sgn-chat-id)
+    ;; Send typing start, at most once per refresh interval
+    (when (or (null sgn-chat--typing-sent-at)
+              (>= (float-time (time-since sgn-chat--typing-sent-at))
+                  sgn-chat--typing-refresh-interval))
+      (sgn-rpc-send-typing sgn-chat-id)
+      (setq sgn-chat--typing-sent-at (current-time)))
     ;; Reset the stop timer
     (when sgn-chat--typing-timer
       (cancel-timer sgn-chat--typing-timer))
     (setq sgn-chat--typing-timer
-          (run-at-time 5 nil #'sgn-chat--stop-typing))))
+          (run-at-time 5 nil #'sgn-chat--stop-typing-in (current-buffer)))))
+
+(defun sgn-chat--stop-typing-in (buffer)
+  "Send the typing stop indicator for the chat in BUFFER, if live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (sgn-chat--stop-typing))))
 
 (defun sgn-chat--stop-typing ()
-  "Send typing stop indicator."
-  (when (and sgn-chat-id (sgn-rpc-alive-p))
+  "Send typing stop indicator, if a start indicator is outstanding."
+  (when (and sgn-chat--typing-sent-at sgn-chat-id (sgn-rpc-alive-p))
     (sgn-rpc-send-typing sgn-chat-id t))
+  (setq sgn-chat--typing-sent-at nil)
   (when sgn-chat--typing-timer
     (cancel-timer sgn-chat--typing-timer)
     (setq sgn-chat--typing-timer nil)))

@@ -805,6 +805,33 @@
       (sgn-test--receive "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+15551234567\",\"sourceNumber\":\"+15551234567\",\"timestamp\":6000,\"dataMessage\":{\"timestamp\":6000,\"reaction\":{\"emoji\":\"👍\",\"targetAuthor\":\"+15550000000\",\"targetSentTimestamp\":1,\"isRemove\":false}}}}}")
       (should (= (plist-get (sgn-db-get-chat "+15551234567") :unread) 0)))))
 
+(ert-deftest sgn-test-typing-indicator-is-throttled ()
+  "Typing sends one start per refresh interval and one stop when idle."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (let ((sent nil)
+          (sgn-send-typing t))
+      (cl-letf (((symbol-function 'sgn-rpc-alive-p) (lambda () t))
+                ((symbol-function 'sgn-rpc-send-typing)
+                 (lambda (_chat-id &optional stop)
+                   (push (if stop 'stop 'start) sent))))
+        (goto-char (point-max))
+        (insert "hello")
+        (insert " there")
+        (should (equal sent '(start)))
+        ;; After the refresh interval, typing sends another start.
+        (setq sgn-chat--typing-sent-at
+              (time-subtract nil (1+ sgn-chat--typing-refresh-interval)))
+        (insert "!")
+        (should (equal sent '(start start)))
+        ;; The idle timer stops typing in the chat, whatever buffer is current.
+        (let ((timer sgn-chat--typing-timer))
+          (with-temp-buffer
+            (apply (timer--function timer) (timer--args timer))))
+        (should (equal sent '(stop start start)))
+        ;; Sending when not typing sends no extra stop.
+        (sgn-chat--stop-typing)
+        (should (equal sent '(stop start start)))))))
+
 (ert-deftest sgn-test-chat-timestamp-format-smart ()
   "Smart timestamp shows time for today's messages."
   (let ((sgn-timestamp-format 'smart)

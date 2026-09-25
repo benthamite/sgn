@@ -200,7 +200,7 @@ The user option @code{sgn-send-read-receipts} controls whether @samp{sgn} sends 
 
 The user option @code{sgn-cli-auto-read-receipts} controls whether the @samp{--send-read-receipts} flag is passed to @samp{signal-cli} at the process level.  The default is @code{nil}.  When enabled@comma{} @samp{signal-cli} sends read receipts for @emph{every} incoming data message regardless of Emacs focus.  Most users should leave this off and rely on @code{sgn-send-read-receipts} instead. @*
 
-The user option @code{sgn-send-typing} controls whether typing indicators are sent to your chat partner while you compose a message.  The default is @code{t}. @*
+The user option @code{sgn-send-typing} controls whether typing indicators are sent to your chat partner while you compose a message.  The default is @code{t}.  A start indicator is sent when you begin typing and repeated every ten seconds while you keep typing; a stop indicator is sent after five seconds without typing@comma{} or when you send the message. @*
 
 @node Linking
 @section Linking

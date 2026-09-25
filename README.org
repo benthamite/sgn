@@ -115,7 +115,7 @@ The user option ~sgn-send-read-receipts~ controls whether =sgn= sends read recei
 
 The user option ~sgn-cli-auto-read-receipts~ controls whether the =--send-read-receipts= flag is passed to =signal-cli= at the process level.  The default is ~nil~.  When enabled, =signal-cli= sends read receipts for /every/ incoming data message regardless of Emacs focus.  Most users should leave this off and rely on ~sgn-send-read-receipts~ instead.
 
-The user option ~sgn-send-typing~ controls whether typing indicators are sent to your chat partner while you compose a message.  The default is ~t~.
+The user option ~sgn-send-typing~ controls whether typing indicators are sent to your chat partner while you compose a message.  The default is ~t~.  A start indicator is sent when you begin typing and repeated every ten seconds while you keep typing; a stop indicator is sent after five seconds without typing, or when you send the message.
 
 ** Linking
 :PROPERTIES:

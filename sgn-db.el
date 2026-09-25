@@ -638,6 +638,14 @@ LIMIT is used in the SQL string directly, not as a parameter."
                   "UPDATE chats SET unread = ? WHERE id = ?"
                   (list count chat-id)))
 
+(defun sgn-db-get-latest-incoming (chat-id account limit)
+  "Return the LIMIT latest messages in CHAT-ID not sent by ACCOUNT.
+Each element is a list (SENDER TIMESTAMP)."
+  (sgn-db--ensure)
+  (sqlite-select sgn-db--connection
+                 "SELECT sender, timestamp FROM messages WHERE chat_id = ? AND sender != ? ORDER BY timestamp DESC LIMIT ?"
+                 (list chat-id account limit)))
+
 (defun sgn-db-increment-unread (chat-id)
   "Increment unread count for CHAT-ID by 1."
   (sgn-db--ensure)

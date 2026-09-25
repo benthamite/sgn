@@ -755,6 +755,56 @@
                     'sgn-message-ts)
                    1790339121167))))))
 
+(defmacro sgn-test--with-receipts (focused &rest body)
+  "Run BODY capturing read receipts in `receipts', with frame focus FOCUSED."
+  (declare (indent 1))
+  `(let ((receipts nil))
+     (cl-letf (((symbol-function 'sgn-dashboard-refresh) #'ignore)
+               ((symbol-function 'sgn-notify-message) #'ignore)
+               ((symbol-function 'sgn-rpc-alive-p) (lambda () t))
+               ((symbol-function 'frame-focus-state) (lambda (&rest _) ,focused))
+               ((symbol-function 'sgn-rpc-send-receipt)
+                (lambda (recipient timestamps &rest _)
+                  (push (cons recipient timestamps) receipts))))
+       ,@body)))
+
+(defconst sgn-test--incoming-text
+  "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+15551234567\",\"sourceNumber\":\"+15551234567\",\"timestamp\":5000,\"dataMessage\":{\"timestamp\":5000,\"message\":\"hi\"}},\"account\":\"+15550000000\"}}"
+  "A text message from +15551234567, as signal-cli reports it.")
+
+(ert-deftest sgn-test-message-in-focused-chat-is-read-at-once ()
+  "A message arriving in the chat on screen is receipted, not counted."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (sgn-test--with-receipts t
+      (set-window-buffer (selected-window) (current-buffer))
+      (sgn-test--receive sgn-test--incoming-text)
+      (should (equal receipts '(("+15551234567" 5000))))
+      (should (= (plist-get (sgn-db-get-chat "+15551234567") :unread) 0)))))
+
+(ert-deftest sgn-test-chat-is-read-when-selected ()
+  "A message that arrives elsewhere is receipted once its chat is selected."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (sgn-test--with-receipts t
+      (set-window-buffer (selected-window) (get-buffer-create "*sgn-test-other*"))
+      (sgn-test--receive sgn-test--incoming-text)
+      (should-not receipts)
+      (should (= (plist-get (sgn-db-get-chat "+15551234567") :unread) 1))
+      (set-window-buffer (selected-window) (current-buffer))
+      (sgn-chat--mark-selected-read)
+      (should (equal receipts '(("+15551234567" 5000))))
+      (should (= (plist-get (sgn-db-get-chat "+15551234567") :unread) 0))
+      ;; Selecting it again sends nothing more.
+      (sgn-chat--mark-selected-read)
+      (should (= (length receipts) 1)))))
+
+(ert-deftest sgn-test-reaction-does-not-count-as-unread ()
+  "Reactions are not unread messages."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (sgn-test--with-receipts nil
+      (sgn-db-upsert-chat "+15551234567" :type "individual")
+      (sgn-test--receive "{\"jsonrpc\":\"2.0\",\"method\":\"receive\",\"params\":{\"envelope\":{\"source\":\"+15551234567\",\"sourceNumber\":\"+15551234567\",\"timestamp\":6000,\"dataMessage\":{\"timestamp\":6000,\"reaction\":{\"emoji\":\"👍\",\"targetAuthor\":\"+15550000000\",\"targetSentTimestamp\":1,\"isRemove\":false}}}}}")
+      (should (= (plist-get (sgn-db-get-chat "+15551234567") :unread) 0)))))
+
 (ert-deftest sgn-test-chat-timestamp-format-smart ()
   "Smart timestamp shows time for today's messages."
   (let ((sgn-timestamp-format 'smart)

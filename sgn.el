@@ -202,11 +202,11 @@ ENVELOPE is the full envelope, SOURCE is the sender, DATA is the dataMessage."
      ((or msg-text attachments sticker)
       (sgn--handle-incoming-message
        chat-id source timestamp msg-text attachments sticker
-       quote-data styles mentions envelope)))
+       quote-data styles mentions envelope)
+      (sgn--update-unread-for-message
+       chat-id source msg-text sticker attachments)))
     ;; Update dashboard
-    (sgn-dashboard-refresh)
-    ;; Update unread & notifications
-    (sgn--update-unread-for-message chat-id source msg-text sticker attachments)))
+    (sgn-dashboard-refresh)))
 
 (defun sgn--handle-incoming-message (chat-id sender timestamp body
                                               attachments sticker
@@ -455,7 +455,10 @@ ENVELOPE is the full envelope, SYNC is the syncMessage."
 ;;;; Unread tracking
 
 (defun sgn--update-unread-for-message (chat-id source body sticker attachments)
-  "Update unread count and send notification for an incoming message."
+  "Count an incoming message in CHAT-ID from SOURCE as unread.
+If the chat is on screen in the selected window of a focused frame,
+mark it read at once; otherwise notify with BODY, STICKER, or
+ATTACHMENTS."
   ;; Only increment for messages from others
   (when (and source (not (equal source sgn-account)))
     ;; Check if chat buffer is focused
@@ -465,8 +468,9 @@ ENVELOPE is the full envelope, SYNC is the syncMessage."
                          (get-buffer-window buf)
                          (eq buf (window-buffer (selected-window)))
                          (frame-focus-state))))
-      (unless focused
-        (sgn-db-increment-unread chat-id)
+      (sgn-db-increment-unread chat-id)
+      (if focused
+          (with-current-buffer buf (sgn-chat--mark-read))
         ;; Send notification
         (let ((notify-body (cond
                             (body body)

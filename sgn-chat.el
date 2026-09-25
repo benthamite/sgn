@@ -20,6 +20,7 @@
 (declare-function sgn--log "sgn")
 (declare-function sgn-db-get-messages "sgn-db")
 (declare-function sgn-db-get-chat "sgn-db")
+(declare-function sgn-db-get-latest-incoming "sgn-db")
 (declare-function sgn-db-save-draft "sgn-db")
 (declare-function sgn-db-get-draft "sgn-db")
 (declare-function sgn-db-get-reactions "sgn-db")
@@ -205,6 +206,12 @@ that they do not shadow `self-insert-command' in the input area.")
   (set-marker-insertion-type sgn-chat--prompt-start t)
   (visual-line-mode 1)
   (add-hook 'after-change-functions #'sgn-chat--on-input-change nil t)
+  ;; A chat counts as read once it is shown in the selected window of
+  ;; a focused frame, however it got there.
+  (add-hook 'window-selection-change-functions #'sgn-chat--mark-selected-read)
+  (add-hook 'window-buffer-change-functions #'sgn-chat--mark-selected-read)
+  (add-function :after after-focus-change-function
+                #'sgn-chat--mark-selected-read)
   (add-hook 'kill-buffer-hook #'sgn-chat--on-kill nil t))
 
 ;;;; Buffer lifecycle
@@ -241,32 +248,30 @@ that they do not shadow `self-insert-command' in the input area.")
     (sgn-chat--mark-read)))
 
 (defun sgn-chat--mark-read ()
-  "Mark the current chat as read and send read receipts if enabled."
-  (when sgn-chat-id
+  "Mark the current chat as read and send read receipts if enabled.
+Receipts cover the chat's unread messages, grouped by sender.
+signal-cli also syncs them to this account's other devices."
+  (when-let* ((sgn-chat-id)
+              (unread (plist-get (sgn-db-get-chat sgn-chat-id) :unread))
+              ((> unread 0)))
+    (when (and sgn-send-read-receipts (sgn-rpc-alive-p))
+      (let ((by-sender nil))
+        (pcase-dolist (`(,sender ,ts)
+                       (sgn-db-get-latest-incoming sgn-chat-id sgn-account unread))
+          (push ts (alist-get sender by-sender nil nil #'equal)))
+        (pcase-dolist (`(,sender . ,timestamps) by-sender)
+          (sgn-rpc-send-receipt sender timestamps))))
     (sgn-db-set-unread sgn-chat-id 0)
     (sgn-notify-update)
-    ;; Send read receipts for visible messages
-    (when (and sgn-send-read-receipts
-               (sgn-rpc-alive-p)
+    (sgn-dashboard-refresh)))
+
+(defun sgn-chat--mark-selected-read (&rest _)
+  "Mark the chat in the selected window read if its frame has focus."
+  (let ((buf (window-buffer (selected-window))))
+    (when (and (eq (buffer-local-value 'major-mode buf) 'sgn-chat-mode)
                (frame-focus-state))
-      ;; Collect timestamps of unread messages from other senders
-      (let ((timestamps nil)
-            (receipt-recipient nil))
-        (save-excursion
-          (goto-char (point-min))
-          (while (< (point) (marker-position sgn-chat--prompt-start))
-            (let ((sender (get-text-property (point) 'sgn-message-sender))
-                  (ts (get-text-property (point) 'sgn-message-ts)))
-              (when (and sender ts
-                         (not (equal sender sgn-account)))
-                (unless receipt-recipient
-                  (setq receipt-recipient sender))
-                (push ts timestamps)))
-            (goto-char (or (next-single-property-change (point) 'sgn-message-ts)
-                           (point-max)))))
-        (when (and receipt-recipient timestamps)
-          (sgn-rpc-send-receipt receipt-recipient
-                                (vconcat (nreverse timestamps))))))))
+      (with-current-buffer buf
+        (sgn-chat--mark-read)))))
 
 ;;;; Prompt management
 

@@ -666,7 +666,8 @@
        (list :rowid 1 :sender "+15551234567" :timestamp 1700000000000
              :chat-id "+15551234567" :body "hello")))
     (goto-char (point-min))
-    (should (eq (key-binding "r") #'sgn-react))
+    (should (eq (key-binding "r") #'sgn-reply))
+    (should (eq (key-binding "R") #'sgn-react))
     (goto-char (point-max))
     (should (eq (key-binding "r") #'self-insert-command))
     (set-window-buffer (selected-window) (current-buffer))

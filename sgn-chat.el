@@ -183,8 +183,8 @@ that they do not shadow `self-insert-command' in the input area.")
 
 (setq sgn-chat-message-map
       (let ((map (make-sparse-keymap)))
-        (define-key map (kbd "r") #'sgn-react)
-        (define-key map (kbd "q") #'sgn-reply)
+        (define-key map (kbd "r") #'sgn-reply)
+        (define-key map (kbd "R") #'sgn-react)
         (define-key map (kbd "e") #'sgn-edit)
         (define-key map (kbd "d") #'sgn-delete)
         (define-key map (kbd "f") #'sgn-forward)

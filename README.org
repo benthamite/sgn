@@ -216,9 +216,9 @@ These commands operate on the message at point in a chat buffer.  Point can be a
 
 #+vindex: sgn-chat-message-map
 The single-key bindings below live in ~sgn-chat-message-map~, which is attached to each rendered message through the =keymap= text property.  They are active only when point is on a message; in the input area the same keys insert text.
-The command ~sgn-react~ sends a reaction to the message at point.  It prompts with ~completing-read~ over common emoji (by name, e.g., "thumbs up", "heart").  You can also type an emoji character directly.  If you have already reacted to the message, invoking ~sgn-react~ again removes your reaction.  Bound to ~r~.
+The command ~sgn-react~ sends a reaction to the message at point.  It prompts with ~completing-read~ over common emoji (by name, e.g., "thumbs up", "heart").  You can also type an emoji character directly.  If you have already reacted to the message, invoking ~sgn-react~ again removes your reaction.  Bound to ~R~.
 
-The command ~sgn-reply~ sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press ~C-g~ (~sgn-chat-cancel-action~) to cancel.  Bound to ~q~.
+The command ~sgn-reply~ sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press ~C-g~ (~sgn-chat-cancel-action~) to cancel.  Bound to ~r~.
 
 The command ~sgn-edit~ places the text of your own message at point into the input area for editing.  Only your own messages can be edited.  The edited text is sent with ~editTimestamp~ so Signal replaces the original.  Press ~C-g~ to cancel.  Bound to ~e~.
 

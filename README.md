@@ -53,7 +53,7 @@ Then:
 1. `M-x sgn-start` --- initializes the database, starts `signal-cli`, and opens the dashboard.
 2. `M-x sgn-chat` --- pick a contact or group to open a chat buffer.
 3. Type your message and press `RET` to send.
-4. Move point to any message and press `r` to react, `q` to quote-reply, `e` to edit, or `d` to delete.
+4. Move point to any message and press `r` to quote-reply, `R` to react, `e` to edit, or `d` to delete.
 
 If Signal unlinks `signal-cli` (it removes linked devices that stay offline for about a month), the mode line shows `[sgn:offline]`. Run `M-x sgn-link` to link it again from Emacs; it can also import the messages you missed from Signal Desktop.
 

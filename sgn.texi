@@ -173,7 +173,7 @@ The user option @code{sgn-message-grouping-interval} specifies the number of sec
 
 The user option @code{sgn-timestamp-format} controls how message timestamps are displayed.  It accepts three values: @code{smart} (the default) shows relative time for recent messages and absolute time for older ones; @code{absolute} always shows the full date and time; @code{relative} always shows relative time (e.g.@comma{} ``5m''@comma{} ``2h''). @*
 
-The user option @code{sgn-prompt} specifies the input prompt string displayed at the bottom of chat buffers.  The default is @samp{"> "}. @*
+The user option @code{sgn-prompt} specifies the input prompt string displayed at the bottom of chat buffers.  The default is @samp{"> "}.  Loaded history and newly arriving messages are always inserted above the prompt. @*
 
 @node Media rendering
 @section Media rendering
@@ -298,9 +298,12 @@ These commands operate on the message at point in a chat buffer.  Point can be a
 @findex sgn-copy-text
 @findex sgn-toggle-pin
 @findex sgn-chat-cancel-action
-The command @code{sgn-react} sends a reaction to the message at point.  It prompts with @code{completing-read} over common emoji (by name@comma{} e.g.@comma{} ``thumbs up''@comma{} ``heart'').  You can also type an emoji character directly.  If you have already reacted to the message@comma{} invoking @code{sgn-react} again removes your reaction.  Bound to @code{r}. @*
 
-The command @code{sgn-reply} sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press @code{C-g} (@code{sgn-chat-cancel-action}) to cancel.  Bound to @code{q}. @*
+@vindex sgn-chat-message-map
+The single-key bindings below live in @code{sgn-chat-message-map}@comma{} which is attached to each rendered message through the @samp{keymap} text property.  They are active only when point is on a message; in the input area the same keys insert text. @*
+The command @code{sgn-react} sends a reaction to the message at point.  It prompts with @code{completing-read} over common emoji (by name@comma{} e.g.@comma{} ``thumbs up''@comma{} ``heart'').  You can also type an emoji character directly.  If you have already reacted to the message@comma{} invoking @code{sgn-react} again removes your reaction.  Bound to @code{R}. @*
+
+The command @code{sgn-reply} sets up a quoted reply to the message at point.  The input prompt changes to show the quoted context.  Press @code{C-g} (@code{sgn-chat-cancel-action}) to cancel.  Bound to @code{r}. @*
 
 The command @code{sgn-edit} places the text of your own message at point into the input area for editing.  Only your own messages can be edited.  The edited text is sent with @code{editTimestamp} so Signal replaces the original.  Press @code{C-g} to cancel.  Bound to @code{e}. @*
 
@@ -406,7 +409,7 @@ On macOS@comma{} the command automatically handles both the legacy plain-text ke
 @findex sgn-load-more-history
 The command @code{sgn-open-at-point} opens media or follows a link at point.  If point is on a button (such as an attachment or link preview)@comma{} it activates it.  Bound to @code{RET} in the message area. @*
 
-The command @code{sgn-load-more-history} loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to @code{g} in chat buffers. @*
+The command @code{sgn-load-more-history} loads older messages from the database.  Pagination by timestamp cursor is not yet implemented.  Bound to @code{g} on messages in chat buffers. @*
 
 @node Functions
 @chapter Functions

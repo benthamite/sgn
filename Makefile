@@ -2,7 +2,7 @@ EMACS ?= emacs
 
 SRCS = sgn-db.el sgn-rpc.el sgn-contacts.el sgn-media.el sgn-format.el \
        sgn-chat.el sgn-actions.el sgn-notify.el sgn-search.el \
-       sgn-dashboard.el sgn.el
+       sgn-dashboard.el sgn-link.el sgn.el
 ELCS = $(SRCS:.el=.elc)
 
 .PHONY: test compile clean

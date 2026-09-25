@@ -42,11 +42,13 @@ User options
 * Message display::
 * Media rendering::
 * Messaging behavior::
+* Linking::
 * Notifications::
 
 Commands
 
 * Starting and stopping::
+* Linking this device::
 * Opening chats::
 * Sending messages and media::
 * Message actions::
@@ -112,6 +114,8 @@ The package is split into focused modules: @*
 @samp{sgn-dashboard.el} --- Chat list buffer with sorting@comma{} unread tracking@comma{} and fade-out truncation. @*
 @item
 @samp{sgn-import.el} --- One-time import of history from Signal Desktop. @*
+@item
+@samp{sgn-link.el} --- Linking @samp{signal-cli} to a Signal account as a secondary device. @*
 @end itemize
 
 @strong{Prerequisites}: @*
@@ -122,7 +126,7 @@ Emacs 29.1 or later@comma{} compiled with SQLite and FTS5 support. @*
 @item
 @samp{signal-cli} v0.14+ installed and in @code{$PATH}@comma{} with a registered or linked Signal account. @*
 @item
-Optional: ImageMagick (@samp{convert}) for animated sticker conversion; @samp{sox} for voice note recording; @samp{sqlcipher} CLI for Signal Desktop import. @*
+Optional: ImageMagick (@samp{convert}) for animated sticker conversion; @samp{sox} for voice note recording; @samp{sqlcipher} CLI for Signal Desktop import; @samp{qrencode} for showing the linking QR code in @code{sgn-link}. @*
 @end enumerate
 
 The package has no external Emacs package dependencies --- it uses only built-in libraries. @*
@@ -137,6 +141,7 @@ The development repository is on @uref{https://github.com/benthamite/sgn, GitHub
 * Message display::
 * Media rendering::
 * Messaging behavior::
+* Linking::
 * Notifications::
 @end menu
 
@@ -197,6 +202,15 @@ The user option @code{sgn-cli-auto-read-receipts} controls whether the @samp{--s
 
 The user option @code{sgn-send-typing} controls whether typing indicators are sent to your chat partner while you compose a message.  The default is @code{t}. @*
 
+@node Linking
+@section Linking
+
+@vindex sgn-link-device-name
+@vindex sgn-link-qrencode-program
+The user option @code{sgn-link-device-name} specifies the device name that @code{sgn-link} registers@comma{} as shown in the phone's list of linked devices.  The default is @samp{"Emacs (sgn)"}. @*
+
+The user option @code{sgn-link-qrencode-program} specifies the @samp{qrencode} executable used to draw the linking QR code.  Without it@comma{} @code{sgn-link} shows the linking URI as text only.  The default is @samp{"qrencode"}. @*
+
 @node Notifications
 @section Notifications
 
@@ -211,6 +225,7 @@ The user option @code{sgn-desktop-notifications} controls whether desktop notifi
 
 @menu
 * Starting and stopping::
+* Linking this device::
 * Opening chats::
 * Sending messages and media::
 * Message actions::
@@ -234,7 +249,17 @@ The command @code{sgn-start} initializes the @samp{sgn} Signal client.  It valid
 
 The command @code{sgn-stop} shuts down the client.  It stops the JSON-RPC subprocess@comma{} cancels all timers (contact refresh@comma{} message expiration)@comma{} closes the database@comma{} and disables the global indicator. @*
 
+If @samp{signal-cli} exits abnormally@comma{} @samp{sgn} does not restart it.  The global indicator changes to @samp{[sgn:offline]}@comma{} the dashboard shows the reason above the chat list@comma{} and sending a message signals the same error.  The message names the command that fixes the problem: @code{sgn-link} when the device is no longer linked (@ref{Linking this device, , Linking this device})@comma{} @code{sgn-start} otherwise.  While the failure lasts@comma{} the periodic contact refresh is stopped. @*
+
 The command @code{sgn-show-log} displays the @samp{*sgn-log*} debug buffer.  This buffer records all JSON-RPC traffic and internal events@comma{} which is useful for troubleshooting connectivity or message delivery issues. @*
+
+@node Linking this device
+@section Linking this device
+
+@findex sgn-link
+@samp{signal-cli} runs as a device linked to your phone's Signal account.  Signal removes linked devices that have been offline for a long time.  If @samp{sgn} has not run for about a month@comma{} @samp{signal-cli} then fails with ``User @dots{} is not registered''@comma{} and no new messages arrive.  Running @samp{sgn} regularly keeps the link alive. @*
+
+The command @code{sgn-link} links @samp{signal-cli} again.  It stops the JSON-RPC subprocess@comma{} runs @samp{signal-cli link}@comma{} and shows a QR code in the @samp{*sgn link*} buffer.  Scan it from the phone under Signal > Settings > Linked devices > Link new device; the code expires after a few minutes@comma{} after which @code{sgn-link} can be run again.  Once linking succeeds@comma{} the command starts @samp{sgn} and warns if the linked number differs from @code{sgn-account}.  If a Signal Desktop database and @samp{sqlcipher} are available@comma{} it then offers to run @code{sgn-import-from-desktop} (@ref{Importing from Signal Desktop, , Importing from Signal Desktop})@comma{} since Signal does not deliver the messages sent while a device was unlinked.  The import skips messages already in the database. @*
 
 @node Opening chats
 @section Opening chats
@@ -356,7 +381,7 @@ The command @code{sgn-contacts-refresh} fetches the latest contacts and groups f
 @section Global indicator
 
 @findex sgn-global-mode
-The minor mode @code{sgn-global-mode} activates the global unread count indicator.  When enabled@comma{} it displays the total unread message count in either the mode line or tab bar@comma{} depending on the value of @code{sgn-notification-style} (@ref{Notifications, , Notifications}).  This mode is enabled automatically by @code{sgn-start} and disabled by @code{sgn-stop}. @*
+The minor mode @code{sgn-global-mode} activates the global unread count indicator.  When enabled@comma{} it displays the total unread message count in either the mode line or tab bar@comma{} depending on the value of @code{sgn-notification-style} (@ref{Notifications, , Notifications}).  If @samp{signal-cli} has failed@comma{} it displays @samp{sgn:offline} instead; hovering over it shows the reason and the command that fixes it.  This mode is enabled automatically by @code{sgn-start} and disabled by @code{sgn-stop}. @*
 
 @node Text formatting
 @section Text formatting
@@ -368,9 +393,9 @@ The command @code{sgn-format-reveal-spoiler-at-point} reveals spoiler text at po
 @section Importing from Signal Desktop
 
 @findex sgn-import-from-desktop
-The command @code{sgn-import-from-desktop} performs a one-time import of message history from Signal Desktop's SQLCipher database into @samp{sgn}'s SQLite database.  This requires the @samp{sqlcipher} CLI tool (installable via @samp{brew install sqlcipher} on macOS) and a local Signal Desktop installation. @*
+The command @code{sgn-import-from-desktop} performs an import of message history from Signal Desktop's SQLCipher database into @samp{sgn}'s SQLite database.  This requires the @samp{sqlcipher} CLI tool (installable via @samp{brew install sqlcipher} on macOS) and a local Signal Desktop installation. @*
 
-The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file@comma{} builds conversation and identity mappings@comma{} imports all messages with their metadata (quotes@comma{} expiration timers@comma{} raw JSON)@comma{} and then imports reactions.  The temporary file is deleted after the import completes. @*
+The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file@comma{} builds conversation and identity mappings@comma{} imports all messages with their metadata (quotes@comma{} expiration timers@comma{} raw JSON)@comma{} and then imports reactions.  The temporary file is deleted after the import completes.  Messages already in the database are skipped@comma{} so the command can be run again to fill a gap in the history@comma{} for example after relinking with @code{sgn-link}. @*
 
 On macOS@comma{} the command automatically handles both the legacy plain-text key and the newer Chromium safeStorage encrypted key format@comma{} decrypting via the macOS Keychain and Node.js. @*
 

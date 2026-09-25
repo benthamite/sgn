@@ -21,6 +21,7 @@
 (declare-function sgn-db-get-chat "sgn-db")
 (declare-function sgn-chat-open "sgn-chat")
 (declare-function sgn-contacts-get-name "sgn-contacts")
+(declare-function sgn-rpc-failure-advice "sgn-rpc")
 
 (defvar sgn-account)
 
@@ -45,6 +46,11 @@
   "Face for unread count indicators."
   :group 'sgn)
 
+(defface sgn-offline-face
+  '((t :inherit error))
+  "Face for the indicator shown when signal-cli has failed."
+  :group 'sgn)
+
 ;;;; Internal state
 
 (defvar sgn-notify--global-unread 0
@@ -61,10 +67,21 @@
 (defun sgn-notify--update-modeline ()
   "Update the modeline indicator string."
   (setq sgn-notify--modeline-string
-        (if (> sgn-notify--global-unread 0)
-            (propertize (format " [sgn:%d]" sgn-notify--global-unread)
-                        'face 'sgn-unread-face)
+        (if-let* ((label (sgn-notify--indicator-label)))
+            (concat " [" label "]")
           "")))
+
+(defun sgn-notify--indicator-label ()
+  "Return the propertized indicator text, or nil when there is nothing to show.
+A signal-cli failure takes precedence over the unread count, since
+no new messages arrive until it is fixed."
+  (cond
+   ((sgn-rpc-failure-advice)
+    (propertize "sgn:offline" 'face 'sgn-offline-face
+                'help-echo (sgn-rpc-failure-advice)))
+   ((> sgn-notify--global-unread 0)
+    (propertize (format "sgn:%d" sgn-notify--global-unread)
+                'face 'sgn-unread-face))))
 
 (defun sgn-notify--install-modeline ()
   "Add the sgn indicator to `global-mode-string'."
@@ -80,10 +97,9 @@
 ;;;; Tab-bar indicator
 
 (defun sgn-notify--tab-bar-item ()
-  "Return a tab-bar item showing the unread count."
-  (when (> sgn-notify--global-unread 0)
-    (propertize (format " sgn:%d " sgn-notify--global-unread)
-                'face 'sgn-unread-face)))
+  "Return a tab-bar item showing the sgn indicator."
+  (when-let* ((label (sgn-notify--indicator-label)))
+    (concat " " label " ")))
 
 (defun sgn-notify--install-tab-bar ()
   "Add the sgn indicator to the tab bar."
@@ -99,12 +115,11 @@
           (delq 'sgn-notify--tab-bar-format tab-bar-format))))
 
 (defun sgn-notify--tab-bar-format ()
-  "Tab bar format function for sgn unread count."
-  (when (> sgn-notify--global-unread 0)
-    `((sgn-unread menu-item
-                  ,(format " sgn:%d " sgn-notify--global-unread)
-                  ignore
-                  :help "Unread Signal messages"))))
+  "Tab bar format function for the sgn indicator."
+  (when-let* ((item (sgn-notify--tab-bar-item)))
+    `((sgn-unread menu-item ,item ignore
+                  :help ,(or (sgn-rpc-failure-advice)
+                             "Unread Signal messages")))))
 
 ;;;; Update unread counts
 

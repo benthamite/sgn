@@ -30,6 +30,7 @@
 (declare-function sgn-contacts-get-name "sgn-contacts")
 (declare-function sgn-contacts-display-sender "sgn-contacts")
 (declare-function sgn-notify-update "sgn-notify")
+(declare-function sgn-rpc-failure-advice "sgn-rpc")
 
 (defvar sgn-account)
 
@@ -87,6 +88,11 @@
 (defface sgn-dashboard-muted-face
   '((t :inherit shadow))
   "Face for muted indicator."
+  :group 'sgn)
+
+(defface sgn-dashboard-failure-face
+  '((t :inherit error))
+  "Face for the banner shown when signal-cli has failed."
   :group 'sgn)
 
 ;;;; Fade-out truncation (adapted from spofy-ui)
@@ -334,7 +340,24 @@ Only include chats that have at least one stored message."
                      (t (string< (nth 3 ka) (nth 3 kb))))))))
     (setq tabulated-list-entries entries)
     (tabulated-list-print t)
-    (sgn-dashboard--apply-fades)))
+    (sgn-dashboard--apply-fades)
+    (sgn-dashboard--update-failure-banner)))
+
+(defvar-local sgn-dashboard--failure-overlay nil
+  "Overlay showing the signal-cli failure above the chat list.")
+
+(defun sgn-dashboard--update-failure-banner ()
+  "Show the signal-cli failure above the chat list, or remove it.
+The banner is an overlay string, so it does not become a row and
+does not affect row lookups."
+  (when sgn-dashboard--failure-overlay
+    (delete-overlay sgn-dashboard--failure-overlay)
+    (setq sgn-dashboard--failure-overlay nil))
+  (when-let* ((advice (sgn-rpc-failure-advice)))
+    (setq sgn-dashboard--failure-overlay (make-overlay (point-min) (point-min)))
+    (overlay-put sgn-dashboard--failure-overlay 'before-string
+                 (propertize (format "No new messages: %s\n\n" advice)
+                             'face 'sgn-dashboard-failure-face))))
 
 (defun sgn-dashboard-refresh ()
   "Refresh the dashboard."

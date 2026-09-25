@@ -20,6 +20,7 @@
   `(let ((sgn-rpc--partial-line "")
          (sgn-rpc--last-output nil)
          (sgn-rpc--failure nil)
+         (sgn-rpc-failure-change-hook nil)
          (sgn-rpc--id-counter 0)
          (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
          (sgn-rpc--request-methods (make-hash-table :test 'equal))
@@ -246,8 +247,37 @@
                                "User +15550000000 is not registered.")))
         (let ((err (should-error (sgn-rpc-send "listContacts" nil)
                                  :type 'user-error)))
-          (should (string-match-p "not registered" (cadr err))))
+          (should (string-match-p "not registered" (cadr err)))
+          (should (string-match-p "M-x sgn-link" (cadr err))))
         (should-not started)))))
+
+(ert-deftest sgn-test-failure-advice-suggests-start-for-other-failures ()
+  "Failures other than an unlinked device suggest restarting sgn."
+  (sgn-test-with-clean-state
+    (setq sgn-rpc--failure "signal-cli exited abnormally with code 3")
+    (should-not (sgn-rpc-unlinked-p))
+    (should (string-suffix-p "run M-x sgn-start" (sgn-rpc-failure-advice)))))
+
+(ert-deftest sgn-test-failure-change-hook-runs-only-on-change ()
+  "The failure change hook runs when the failure is set or cleared."
+  (sgn-test-with-clean-state
+    (let ((runs 0))
+      (add-hook 'sgn-rpc-failure-change-hook (lambda () (cl-incf runs)))
+      (sgn-rpc--set-failure "boom")
+      (sgn-rpc--set-failure "boom")
+      (sgn-rpc--set-failure nil)
+      (should (= runs 2)))))
+
+(ert-deftest sgn-test-indicator-shows-offline-over-unread ()
+  "A signal-cli failure replaces the unread count in the indicator."
+  (sgn-test-with-clean-state
+    (let ((sgn-notify--global-unread 3))
+      (should (equal (sgn-notify--indicator-label) "sgn:3"))
+      (setq sgn-rpc--failure "signal-cli exited abnormally with code 1")
+      (should (equal (sgn-notify--indicator-label) "sgn:offline"))
+      (sgn-notify--update-modeline)
+      (should (equal (substring-no-properties sgn-notify--modeline-string)
+                     " [sgn:offline]")))))
 
 (ert-deftest sgn-test-handle-result-invokes-callback ()
   "Stored callback is invoked with the result value."
@@ -682,6 +712,64 @@
                                        '("name" "age"))))
     (should (equal (plist-get result :name) "alice"))
     (should (equal (plist-get result :age) 42))))
+
+;;;; Failure banner and linking
+
+(ert-deftest sgn-test-dashboard-failure-banner ()
+  "The dashboard shows the failure banner only while signal-cli is failing."
+  (sgn-test-with-clean-state
+    (with-temp-buffer
+      (insert "row\n")
+      (setq sgn-rpc--failure
+            "signal-cli exited abnormally with code 1: User +1 is not registered.")
+      (sgn-dashboard--update-failure-banner)
+      (should (string-match-p
+               "No new messages: .*not registered.*run M-x sgn-link"
+               (overlay-get sgn-dashboard--failure-overlay 'before-string)))
+      (setq sgn-rpc--failure nil)
+      (sgn-dashboard--update-failure-banner)
+      (should-not sgn-dashboard--failure-overlay)
+      (should-not (overlays-in (point-min) (point-max))))))
+
+(ert-deftest sgn-test-link-filter-shows-qr-once ()
+  "The linking URI is shown once, even when output arrives in pieces."
+  (let ((sgn-link--output "")
+        (shown nil))
+    (cl-letf (((symbol-function 'sgn-link--show-qr)
+               (lambda (uri) (push uri shown))))
+      (sgn-link--filter nil "sgnl://linkdevice?uuid=abc")
+      (sgn-link--filter nil "&pub_key=xyz\n")
+      (sgn-link--filter nil "INFO linking in progress\n")
+      (should (equal shown '("sgnl://linkdevice?uuid=abc&pub_key=xyz"))))))
+
+(ert-deftest sgn-test-link-sentinel-reports-failure ()
+  "A failed link shows signal-cli's reason and how to retry."
+  (let ((sgn-link--output "sgnl://linkdevice?uuid=abc\nLink request timed out, please try again.\n")
+        (shown nil)
+        (proc (start-process "sgn-test-false" nil "false")))
+    (while (process-live-p proc) (accept-process-output proc 0.1))
+    (cl-letf (((symbol-function 'sgn-link--show)
+               (lambda (text) (setq shown text)))
+              ((symbol-function 'sgn--log) #'ignore))
+      (sgn-link--sentinel proc "exited abnormally with code 1\n")
+      (should (string-match-p "Link request timed out" shown))
+      (should (string-match-p "M-x sgn-link" shown)))))
+
+(ert-deftest sgn-test-link-finish-starts-and-offers-import ()
+  "A successful link restarts sgn and imports when the user accepts."
+  (let ((sgn-account "+15550000000")
+        (sgn-link--output "Associated with: +15550000000\n")
+        (calls nil))
+    (cl-letf (((symbol-function 'sgn-start) (lambda () (push 'start calls)))
+              ((symbol-function 'sgn-import-desktop-available-p) (lambda () t))
+              ((symbol-function 'y-or-n-p) (lambda (_) t))
+              ((symbol-function 'sgn-import-from-desktop)
+               (lambda () (push 'import calls)))
+              ((symbol-function 'display-warning)
+               (lambda (&rest _) (push 'warn calls)))
+              ((symbol-function 'message) #'ignore))
+      (sgn-link--finish)
+      (should (equal (reverse calls) '(start import))))))
 
 (provide 'sgn-test)
 ;;; sgn-test.el ends here

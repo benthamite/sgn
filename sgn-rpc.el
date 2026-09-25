@@ -129,6 +129,9 @@ as plain text before exiting.")
 While non-nil, `sgn-rpc-send' signals this failure instead of
 restarting the process.  `sgn-rpc-start' clears it.")
 
+(defvar sgn-rpc-failure-change-hook nil
+  "Hook run after `sgn-rpc--failure' is set or cleared.")
+
 ;;; Lifecycle
 
 (defun sgn-rpc-start ()
@@ -148,7 +151,7 @@ mode, signal-cli receives messages automatically."
   ;; Reset all state.
   (setq sgn-rpc--partial-line "")
   (setq sgn-rpc--last-output nil)
-  (setq sgn-rpc--failure nil)
+  (sgn-rpc--set-failure nil)
   (clrhash sgn-rpc--pending-callbacks)
   (clrhash sgn-rpc--request-methods)
   (clrhash sgn-rpc--request-params)
@@ -209,7 +212,7 @@ If signal-cli exited abnormally, signal that failure instead: a
 restart would fail the same way, and `sgn-start' schedules RPC
 sends of its own, so restarting here would loop."
   (when sgn-rpc--failure
-    (user-error "%s (fix it, then run M-x sgn-start)" sgn-rpc--failure))
+    (user-error "%s" (sgn-rpc-failure-advice)))
   (sgn--log "sgn service not running; starting before RPC send.")
   (sgn-start)
   (unless (sgn-rpc-alive-p)
@@ -255,14 +258,33 @@ the last text signal-cli printed."
   (sgn--log "Process event: %s" (string-trim event))
   (cond
    ((string-prefix-p "exited abnormally" event)
-    (setq sgn-rpc--failure
-          (format "signal-cli %s%s" (string-trim event)
-                  (if sgn-rpc--last-output
-                      (format ": %s" sgn-rpc--last-output)
-                    "")))
-    (message "sgn: %s" sgn-rpc--failure))
+    (sgn-rpc--set-failure
+     (format "signal-cli %s%s" (string-trim event)
+             (if sgn-rpc--last-output
+                 (format ": %s" sgn-rpc--last-output)
+               "")))
+    (message "sgn: %s" (sgn-rpc-failure-advice)))
    ((string-prefix-p "exited" event)
     (message "sgn process exited."))))
+
+(defun sgn-rpc--set-failure (failure)
+  "Set `sgn-rpc--failure' to FAILURE and run the change hook if it changed."
+  (unless (equal failure sgn-rpc--failure)
+    (setq sgn-rpc--failure failure)
+    (run-hooks 'sgn-rpc-failure-change-hook)))
+
+(defun sgn-rpc-unlinked-p ()
+  "Return non-nil if signal-cli failed because the device is not linked.
+Signal removes linked devices that stay offline for a long time,
+after which signal-cli reports the account as not registered."
+  (and sgn-rpc--failure
+       (string-match-p "is not registered" sgn-rpc--failure)))
+
+(defun sgn-rpc-failure-advice ()
+  "Return `sgn-rpc--failure' followed by the command that fixes it."
+  (when sgn-rpc--failure
+    (format "%s; run M-x %s" (string-remove-suffix "." sgn-rpc--failure)
+            (if (sgn-rpc-unlinked-p) "sgn-link" "sgn-start"))))
 
 ;;; Dispatch
 

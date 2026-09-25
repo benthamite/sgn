@@ -35,12 +35,13 @@ The package is split into focused modules:
 - =sgn-search.el= --- FTS5-powered search across conversations.
 - =sgn-dashboard.el= --- Chat list buffer with sorting, unread tracking, and fade-out truncation.
 - =sgn-import.el= --- One-time import of history from Signal Desktop.
+- =sgn-link.el= --- Linking =signal-cli= to a Signal account as a secondary device.
 
 *Prerequisites*:
 
 1. Emacs 29.1 or later, compiled with SQLite and FTS5 support.
 2. =signal-cli= v0.14+ installed and in ~$PATH~, with a registered or linked Signal account.
-3. Optional: ImageMagick (=convert=) for animated sticker conversion; =sox= for voice note recording; =sqlcipher= CLI for Signal Desktop import.
+3. Optional: ImageMagick (=convert=) for animated sticker conversion; =sox= for voice note recording; =sqlcipher= CLI for Signal Desktop import; =qrencode= for showing the linking QR code in ~sgn-link~.
 
 The package has no external Emacs package dependencies --- it uses only built-in libraries.
 
@@ -116,6 +117,17 @@ The user option ~sgn-cli-auto-read-receipts~ controls whether the =--send-read-r
 
 The user option ~sgn-send-typing~ controls whether typing indicators are sent to your chat partner while you compose a message.  The default is ~t~.
 
+** Linking
+:PROPERTIES:
+:CUSTOM_ID: h:linking-options
+:END:
+
+#+vindex: sgn-link-device-name
+#+vindex: sgn-link-qrencode-program
+The user option ~sgn-link-device-name~ specifies the device name that ~sgn-link~ registers, as shown in the phone's list of linked devices.  The default is ="Emacs (sgn)"=.
+
+The user option ~sgn-link-qrencode-program~ specifies the =qrencode= executable used to draw the linking QR code.  Without it, ~sgn-link~ shows the linking URI as text only.  The default is ="qrencode"=.
+
 ** Notifications
 :PROPERTIES:
 :CUSTOM_ID: h:notifications
@@ -144,7 +156,19 @@ The command ~sgn-start~ initializes the =sgn= Signal client.  It validates that 
 
 The command ~sgn-stop~ shuts down the client.  It stops the JSON-RPC subprocess, cancels all timers (contact refresh, message expiration), closes the database, and disables the global indicator.
 
+If =signal-cli= exits abnormally, =sgn= does not restart it.  The global indicator changes to =[sgn:offline]=, the dashboard shows the reason above the chat list, and sending a message signals the same error.  The message names the command that fixes the problem: ~sgn-link~ when the device is no longer linked ([[#h:linking][Linking this device]]), ~sgn-start~ otherwise.  While the failure lasts, the periodic contact refresh is stopped.
+
 The command ~sgn-show-log~ displays the =*sgn-log*= debug buffer.  This buffer records all JSON-RPC traffic and internal events, which is useful for troubleshooting connectivity or message delivery issues.
+
+** Linking this device
+:PROPERTIES:
+:CUSTOM_ID: h:linking
+:END:
+
+#+findex: sgn-link
+=signal-cli= runs as a device linked to your phone's Signal account.  Signal removes linked devices that have been offline for a long time.  If =sgn= has not run for about a month, =signal-cli= then fails with "User ... is not registered", and no new messages arrive.  Running =sgn= regularly keeps the link alive.
+
+The command ~sgn-link~ links =signal-cli= again.  It stops the JSON-RPC subprocess, runs =signal-cli link=, and shows a QR code in the =*sgn link*= buffer.  Scan it from the phone under Signal > Settings > Linked devices > Link new device; the code expires after a few minutes, after which ~sgn-link~ can be run again.  Once linking succeeds, the command starts =sgn= and warns if the linked number differs from ~sgn-account~.  If a Signal Desktop database and =sqlcipher= are available, it then offers to run ~sgn-import-from-desktop~ ([[#h:importing-from-signal-desktop][Importing from Signal Desktop]]), since Signal does not deliver the messages sent while a device was unlinked.  The import skips messages already in the database.
 
 ** Opening chats
 :PROPERTIES:
@@ -282,7 +306,7 @@ The command ~sgn-contacts-refresh~ fetches the latest contacts and groups from =
 :END:
 
 #+findex: sgn-global-mode
-The minor mode ~sgn-global-mode~ activates the global unread count indicator.  When enabled, it displays the total unread message count in either the mode line or tab bar, depending on the value of ~sgn-notification-style~ ([[#h:notifications][Notifications]]).  This mode is enabled automatically by ~sgn-start~ and disabled by ~sgn-stop~.
+The minor mode ~sgn-global-mode~ activates the global unread count indicator.  When enabled, it displays the total unread message count in either the mode line or tab bar, depending on the value of ~sgn-notification-style~ ([[#h:notifications][Notifications]]).  If =signal-cli= has failed, it displays =sgn:offline= instead; hovering over it shows the reason and the command that fixes it.  This mode is enabled automatically by ~sgn-start~ and disabled by ~sgn-stop~.
 
 ** Text formatting
 :PROPERTIES:
@@ -298,9 +322,9 @@ The command ~sgn-format-reveal-spoiler-at-point~ reveals spoiler text at point. 
 :END:
 
 #+findex: sgn-import-from-desktop
-The command ~sgn-import-from-desktop~ performs a one-time import of message history from Signal Desktop's SQLCipher database into =sgn='s SQLite database.  This requires the =sqlcipher= CLI tool (installable via =brew install sqlcipher= on macOS) and a local Signal Desktop installation.
+The command ~sgn-import-from-desktop~ performs an import of message history from Signal Desktop's SQLCipher database into =sgn='s SQLite database.  This requires the =sqlcipher= CLI tool (installable via =brew install sqlcipher= on macOS) and a local Signal Desktop installation.
 
-The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file, builds conversation and identity mappings, imports all messages with their metadata (quotes, expiration timers, raw JSON), and then imports reactions.  The temporary file is deleted after the import completes.
+The import process exports Signal Desktop's encrypted database to a temporary plain SQLite file, builds conversation and identity mappings, imports all messages with their metadata (quotes, expiration timers, raw JSON), and then imports reactions.  The temporary file is deleted after the import completes.  Messages already in the database are skipped, so the command can be run again to fill a gap in the history, for example after relinking with ~sgn-link~.
 
 On macOS, the command automatically handles both the legacy plain-text key and the newer Chromium safeStorage encrypted key format, decrypting via the macOS Keychain and Node.js.
 

@@ -55,6 +55,8 @@ Then:
 3. Type your message and press `RET` to send.
 4. Move point to any message and press `r` to react, `q` to quote-reply, `e` to edit, or `d` to delete.
 
+If Signal unlinks `signal-cli` (it removes linked devices that stay offline for about a month), the mode line shows `[sgn:offline]`. Run `M-x sgn-link` to link it again from Emacs; it can also import the messages you missed from Signal Desktop.
+
 ## Documentation
 
 For a comprehensive description of all user options, commands, and functions, see the [manual](https://stafforini.com/notes/sgn/).

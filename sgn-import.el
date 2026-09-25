@@ -282,6 +282,11 @@ Return the number of reactions imported."
 
 ;;;; Top-level command
 
+(defun sgn-import-desktop-available-p ()
+  "Return non-nil if a Signal Desktop database is available to import."
+  (and (file-exists-p sgn-import--desktop-db-path)
+       (executable-find "sqlcipher")))
+
 ;;;###autoload
 (defun sgn-import-from-desktop ()
   "Import message history from Signal Desktop into sgn's database.

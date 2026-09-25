@@ -123,6 +123,7 @@ data message regardless of Emacs focus."
 (require 'sgn-search)
 (require 'sgn-import)
 (require 'sgn-dashboard)
+(require 'sgn-link)
 
 ;;;; Utility
 
@@ -510,6 +511,7 @@ refreshes contacts, and opens the dashboard."
   (sgn-contacts-load-from-db)
   ;; Set up receive handler
   (setq sgn-rpc-receive-handler #'sgn--handle-receive)
+  (add-hook 'sgn-rpc-failure-change-hook #'sgn--on-failure-change)
   ;; Start RPC process
   (sgn-rpc-start)
   ;; Start periodic refresh
@@ -523,6 +525,16 @@ refreshes contacts, and opens the dashboard."
   ;; Enable global indicator
   (sgn-global-mode 1)
   (message "sgn started."))
+
+(defun sgn--on-failure-change ()
+  "Update indicators after signal-cli fails or recovers.
+On failure, also stop the periodic contact refresh, which would
+otherwise signal the same failure every few minutes."
+  (when sgn-rpc--failure
+    (sgn-contacts-stop-refresh-timer))
+  (sgn-notify--update-modeline)
+  (force-mode-line-update t)
+  (sgn-dashboard-refresh))
 
 ;;;###autoload
 (defun sgn-stop ()

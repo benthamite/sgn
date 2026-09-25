@@ -84,7 +84,7 @@ The user option ~sgn-message-grouping-interval~ specifies the number of seconds 
 
 The user option ~sgn-timestamp-format~ controls how message timestamps are displayed.  It accepts three values: ~smart~ (the default) shows relative time for recent messages and absolute time for older ones; ~absolute~ always shows the full date and time; ~relative~ always shows relative time (e.g., "5m", "2h").
 
-The user option ~sgn-prompt~ specifies the input prompt string displayed at the bottom of chat buffers.  The default is ="> "=.
+The user option ~sgn-prompt~ specifies the input prompt string displayed at the bottom of chat buffers.  The default is ="> "=.  Loaded history and newly arriving messages are always inserted above the prompt.
 
 ** Media rendering
 :PROPERTIES:

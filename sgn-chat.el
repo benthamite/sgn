@@ -199,6 +199,9 @@ that they do not shadow `self-insert-command' in the input area.")
   "Major mode for Signal chat buffers."
   (setq-local sgn-chat--input-marker (make-marker))
   (setq-local sgn-chat--prompt-start (make-marker))
+  ;; Text inserted at the prompt start (history, new messages) goes
+  ;; above the prompt, so the marker must advance past it.
+  (set-marker-insertion-type sgn-chat--prompt-start t)
   (visual-line-mode 1)
   (add-hook 'after-change-functions #'sgn-chat--on-input-change nil t)
   (add-hook 'kill-buffer-hook #'sgn-chat--on-kill nil t))
@@ -270,13 +273,15 @@ that they do not shadow `self-insert-command' in the input area.")
   "Draw the input prompt and update markers."
   (let ((inhibit-read-only t))
     (goto-char (point-max))
-    (set-marker sgn-chat--prompt-start (point))
-    (let ((prompt-text (sgn-chat--build-prompt-text)))
+    (let ((start (point))
+          (prompt-text (sgn-chat--build-prompt-text)))
       (insert (propertize prompt-text
                           'read-only t
                           'face 'minibuffer-prompt
                           'rear-nonsticky '(read-only face)
-                          'front-sticky '(read-only face))))
+                          'front-sticky '(read-only face)))
+      ;; Set after inserting: the marker advances over insertions.
+      (set-marker sgn-chat--prompt-start start))
     (set-marker sgn-chat--input-marker (point))))
 
 (defun sgn-chat--build-prompt-text ()

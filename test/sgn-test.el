@@ -673,6 +673,26 @@
     (execute-kbd-macro "red")
     (should (equal (sgn-chat--get-input-text) "red"))))
 
+(ert-deftest sgn-test-chat-prompt-start-follows-history ()
+  "Loaded history and new messages render above the prompt."
+  (sgn-test-with-chat-buffer "+15551234567"
+    (sgn-db-upsert-chat "+15551234567" :name "Alice" :type "individual")
+    (sgn-db-insert-message
+     (list :chat-id "+15551234567" :sender "+15551234567"
+           :timestamp 1700000000000 :body "old" :type "data"))
+    (sgn-chat--load-history)
+    (goto-char (marker-position sgn-chat--prompt-start))
+    (should (looking-at-p (regexp-quote (sgn-chat--build-prompt-text))))
+    (let ((inhibit-read-only t))
+      (save-excursion
+        (goto-char (marker-position sgn-chat--prompt-start))
+        (sgn-chat--render-message
+         (list :rowid 2 :sender "+15551234567" :timestamp 1700000100000
+               :chat-id "+15551234567" :body "new"))))
+    (should (< (save-excursion (goto-char (point-min)) (search-forward "old"))
+               (save-excursion (goto-char (point-min)) (search-forward "new"))
+               (marker-position sgn-chat--prompt-start)))))
+
 (ert-deftest sgn-test-chat-timestamp-format-smart ()
   "Smart timestamp shows time for today's messages."
   (let ((sgn-timestamp-format 'smart)

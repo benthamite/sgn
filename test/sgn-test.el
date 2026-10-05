@@ -936,6 +936,27 @@
       (should-not sgn-dashboard--failure-overlay)
       (should-not (overlays-in (point-min) (point-max))))))
 
+(ert-deftest sgn-test-dashboard-starts-service-when-down ()
+  "Opening the dashboard starts sgn unless it is running or has failed."
+  (sgn-test-with-db
+    (sgn-test-with-clean-state
+      (let ((alive nil)
+            (starts 0))
+        (cl-letf (((symbol-function 'sgn-rpc-alive-p) (lambda () alive))
+                  ((symbol-function 'sgn-start) (lambda () (cl-incf starts))))
+          (unwind-protect
+              (progn
+                (sgn-dashboard)
+                (should (= starts 1))
+                (setq alive t)
+                (sgn-dashboard)
+                (should (= starts 1))
+                (setq alive nil
+                      sgn-rpc--failure "signal-cli exited abnormally")
+                (sgn-dashboard)
+                (should (= starts 1)))
+            (kill-buffer sgn-dashboard--buffer-name)))))))
+
 (ert-deftest sgn-test-link-filter-shows-qr-once ()
   "The linking URI is shown once, even when output arrives in pieces."
   (let ((sgn-link--output "")

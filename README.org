@@ -182,7 +182,7 @@ The command ~sgn-chat~ prompts for a recipient using ~completing-read~ over all 
 
 The command ~sgn-note-to-self~ opens the "Note to Self" chat, which is the conversation with your own Signal account.
 
-The command ~sgn-dashboard~ opens the chat list buffer ([[#h:dashboard][Dashboard]]).
+The command ~sgn-dashboard~ opens the chat list buffer ([[#h:dashboard][Dashboard]]).  If the =sgn= service is not running, it starts it first, unless signal-cli has already failed, in which case the dashboard shows the failure.
 
 ** Sending messages and media
 :PROPERTIES:

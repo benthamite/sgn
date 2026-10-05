@@ -31,6 +31,10 @@
 (declare-function sgn-contacts-display-sender "sgn-contacts")
 (declare-function sgn-notify-update "sgn-notify")
 (declare-function sgn-rpc-failure-advice "sgn-rpc")
+(declare-function sgn-rpc-alive-p "sgn-rpc")
+(declare-function sgn-start "sgn")
+
+(defvar sgn-rpc--failure)
 
 (defvar sgn-account)
 
@@ -365,9 +369,13 @@ Only include chats that have at least one stored message."
 
 ;;;###autoload
 (defun sgn-dashboard ()
-  "Open the sgn dashboard."
+  "Open the sgn dashboard, starting sgn if it is not running.
+If signal-cli has already failed, do not restart it: the
+dashboard shows the failure instead."
   (interactive)
   (require 'sgn)
+  (unless (or (sgn-rpc-alive-p) sgn-rpc--failure)
+    (sgn-start))
   (let ((buf (get-buffer-create sgn-dashboard--buffer-name)))
     (with-current-buffer buf
       (unless (eq major-mode 'sgn-dashboard-mode)

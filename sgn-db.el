@@ -127,6 +127,7 @@ Creates and drops a temporary FTS5 table.  Signals `user-error' on failure."
     expires_at  INTEGER,
     styles_json TEXT,
     raw_json    TEXT,
+    send_status TEXT,
     UNIQUE(chat_id, sender, timestamp)
 )"))
 
@@ -240,12 +241,20 @@ END"))
   "Return the current schema version from DB."
   (caar (sqlite-select db "PRAGMA user_version")))
 
+(defconst sgn-db--schema-version 2
+  "Current schema version of the database.")
+
 (defun sgn-db--maybe-create-schema (db)
-  "Create schema in DB if it is at version 0 (fresh database)."
-  (when (zerop (sgn-db--get-schema-version db))
-    (sgn-db--create-tables db)
-    (sgn-db--set-schema-version db 1)
-    (sgn--log "sgn-db: schema created (version 1)")))
+  "Create the schema in DB, or migrate it to the current version."
+  (pcase (sgn-db--get-schema-version db)
+    (0
+     (sgn-db--create-tables db)
+     (sgn-db--set-schema-version db sgn-db--schema-version)
+     (sgn--log "sgn-db: schema created (version %d)" sgn-db--schema-version))
+    (1
+     (sqlite-execute db "ALTER TABLE messages ADD COLUMN send_status TEXT")
+     (sgn-db--set-schema-version db 2)
+     (sgn--log "sgn-db: schema migrated to version 2"))))
 
 ;;;; Database lifecycle
 
@@ -365,23 +374,24 @@ Unless INCLUDE-EMPTY is non-nil, exclude chats with no messages
 (defconst sgn-db--message-columns
   '("rowid" "chat_id" "sender" "timestamp" "body" "type"
     "quote_ts" "quote_author" "quote_body" "edited_at" "deleted"
-    "expires_in" "expire_started_at" "expires_at" "styles_json" "raw_json")
+    "expires_in" "expire_started_at" "expires_at" "styles_json" "raw_json"
+    "send_status")
   "Column names for message query results.")
 
 (defconst sgn-db--message-select
-  "SELECT rowid, chat_id, sender, timestamp, body, type, quote_ts, quote_author, quote_body, edited_at, deleted, expires_in, expire_started_at, expires_at, styles_json, raw_json FROM messages"
+  "SELECT rowid, chat_id, sender, timestamp, body, type, quote_ts, quote_author, quote_body, edited_at, deleted, expires_in, expire_started_at, expires_at, styles_json, raw_json, send_status FROM messages"
   "Base SELECT clause for message queries.")
 
 (defun sgn-db-insert-message (attrs)
   "Insert message from ATTRS plist.  Return the new rowid.
 ATTRS keys: :chat-id :sender :timestamp :body :type :quote-ts
 :quote-author :quote-body :edited-at :deleted :expires-in
-:expire-started-at :expires-at :styles-json :raw-json.
+:expire-started-at :expires-at :styles-json :raw-json :send-status.
 Uses INSERT OR IGNORE for the UNIQUE constraint."
   (sgn-db--ensure)
   (sqlite-execute
    sgn-db--connection
-   "INSERT OR IGNORE INTO messages (chat_id, sender, timestamp, body, type, quote_ts, quote_author, quote_body, edited_at, deleted, expires_in, expire_started_at, expires_at, styles_json, raw_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+   "INSERT OR IGNORE INTO messages (chat_id, sender, timestamp, body, type, quote_ts, quote_author, quote_body, edited_at, deleted, expires_in, expire_started_at, expires_at, styles_json, raw_json, send_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
    (sgn-db--message-values-from-attrs attrs))
   (caar (sqlite-select sgn-db--connection "SELECT last_insert_rowid()")))
 
@@ -401,7 +411,8 @@ Uses INSERT OR IGNORE for the UNIQUE constraint."
         (plist-get attrs :expire-started-at)
         (plist-get attrs :expires-at)
         (plist-get attrs :styles-json)
-        (plist-get attrs :raw-json)))
+        (plist-get attrs :raw-json)
+        (plist-get attrs :send-status)))
 
 (defun sgn-db-get-messages (chat-id &optional limit offset)
   "Return list of message plists for CHAT-ID, ordered by timestamp ASC.
@@ -447,13 +458,14 @@ reverses to produce chronological order."
     (:expires-in . "expires_in")
     (:expire-started-at . "expire_started_at")
     (:expires-at . "expires_at")
-    (:styles-json . "styles_json"))
+    (:styles-json . "styles_json")
+    (:send-status . "send_status"))
   "Alist mapping updatable message attribute keywords to SQL column names.")
 
 (defun sgn-db-update-message (rowid attrs)
   "Update message ROWID with ATTRS plist.
 ATTRS keys: :timestamp :body :edited-at :deleted :expires-in
-:expire-started-at :expires-at :styles-json."
+:expire-started-at :expires-at :styles-json :send-status."
   (sgn-db--ensure)
   (let ((provided (sgn-db--extract-provided-attrs attrs sgn-db--message-updatable-attrs)))
     (when provided
@@ -467,6 +479,14 @@ PROVIDED is a list of (column . value) cons cells."
          (values (mapcar #'cdr provided))
          (sql (format "UPDATE %s SET %s WHERE %s = ?" table set-clause id-column)))
     (sqlite-execute sgn-db--connection sql (append values (list id-value)))))
+
+(defun sgn-db-mark-interrupted-sends ()
+  "Mark messages still sending as unconfirmed.
+Their sends were interrupted, for example by Emacs exiting, so
+signal-cli's reply will never arrive."
+  (sgn-db--ensure)
+  (sqlite-execute sgn-db--connection
+                  "UPDATE messages SET send_status = 'unconfirmed' WHERE send_status = 'sending'"))
 
 (defun sgn-db-delete-message (rowid)
   "Mark message ROWID as deleted.
@@ -593,7 +613,7 @@ ATTRS: :message-rowid :chat-id :target-author :target-timestamp
   '("rowid" "chat_id" "sender" "timestamp" "body" "type"
     "quote_ts" "quote_author" "quote_body" "edited_at" "deleted"
     "expires_in" "expire_started_at" "expires_at" "styles_json" "raw_json"
-    "snippet")
+    "send_status" "snippet")
   "Column names for search query results (message columns plus snippet).")
 
 (defun sgn-db-search (query &optional chat-id limit)
@@ -606,6 +626,7 @@ highlighted matches delimited by brackets."
          (base (concat "SELECT m.rowid, m.chat_id, m.sender, m.timestamp, m.body, m.type,"
                        " m.quote_ts, m.quote_author, m.quote_body, m.edited_at, m.deleted,"
                        " m.expires_in, m.expire_started_at, m.expires_at, m.styles_json, m.raw_json,"
+                       " m.send_status,"
                        " highlight(messages_fts, 0, '[', ']') AS snippet"
                        " FROM messages_fts"
                        " JOIN messages m ON m.rowid = messages_fts.rowid"

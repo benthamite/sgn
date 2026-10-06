@@ -74,6 +74,23 @@
   :type 'integer
   :group 'sgn)
 
+(defcustom sgn-send-timeout 30
+  "Seconds to wait for signal-cli to confirm a sent message.
+A message still unconfirmed after this long is marked as such in
+the chat buffer.  It is marked as sent if confirmation arrives
+later."
+  :type 'integer
+  :group 'sgn)
+
+(defconst sgn-chat--send-status-labels
+  '(("sending" "sending…" sgn-timestamp-face)
+    ("unconfirmed" "not confirmed: may not have been sent" sgn-error-face)
+    ("failed" "not sent" sgn-error-face)
+    ("partial" "not delivered to every recipient" sgn-error-face))
+  "Labels shown after sent messages, by send status.
+Each entry is (STATUS LABEL FACE).  Messages whose status is not
+listed, such as confirmed or received ones, show no label.")
+
 (defcustom sgn-timestamp-format 'smart
   "How to format message timestamps.
 `smart' uses relative for recent, absolute for older.
@@ -412,32 +429,64 @@ signal-cli also syncs them to this account's other devices."
 
 (defun sgn-chat--send-and-persist (chat-id body extras styles-json
                                            quote-ts quote-author quote-body)
-  "Send BODY to CHAT-ID with RPC EXTRAS, rendering it optimistically.
+  "Send BODY to CHAT-ID with RPC EXTRAS, rendering it as sending.
 STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and QUOTE-BODY describe the
-message.  Once signal-cli replies, the stored timestamp is replaced
-by the one Signal assigned, which other clients use to refer to the
-message in reactions, quotes, edits, and deletes."
+message.  Once signal-cli replies, the message is marked as sent or
+failed, and the stored timestamp is replaced by the one Signal
+assigned, which other clients use to refer to the message in
+reactions, quotes, edits, and deletes.  Without a reply within
+`sgn-send-timeout' seconds, or if signal-cli stops before replying,
+the message is marked as unconfirmed."
   (let ((rowid (sgn-chat--persist-and-render-sent
                 chat-id body styles-json quote-ts quote-author quote-body)))
     (sgn-rpc-send-message
      chat-id body extras
      (lambda (result)
-       (when-let* ((rowid rowid)
-                   (timestamp (alist-get 'timestamp result)))
-         (sgn-chat--set-sent-timestamp chat-id rowid timestamp))))))
+       (sgn-chat--update-sent
+        chat-id rowid
+        (list :send-status (sgn-chat--send-result-status result)
+              :timestamp (alist-get 'timestamp result))))
+     (lambda (error-obj)
+       (sgn-chat--update-sent
+        chat-id rowid
+        (list :send-status (if (alist-get 'abandoned error-obj)
+                               "unconfirmed"
+                             "failed")))))
+    (run-at-time sgn-send-timeout nil
+                 #'sgn-chat--mark-unconfirmed chat-id rowid)))
 
-(defun sgn-chat--set-sent-timestamp (chat-id rowid timestamp)
-  "Record Signal TIMESTAMP for sent message ROWID in CHAT-ID."
-  (sgn-db-update-message rowid (list :timestamp timestamp))
-  (when-let* ((buf (get-buffer
-                    (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
-    (with-current-buffer buf
-      (sgn-chat-update-message rowid))))
+(defun sgn-chat--send-result-status (result)
+  "Return the send status for signal-cli send RESULT.
+RESULT lists the outcome for each recipient.  The status is
+\"sent\" when every recipient succeeded, \"failed\" when none did,
+and \"partial\" otherwise."
+  (let* ((types (mapcar (lambda (r) (alist-get 'type r))
+                        (alist-get 'results result)))
+         (successes (cl-count "SUCCESS" types :test #'equal)))
+    (cond
+     ((= successes (length types)) "sent")
+     ((zerop successes) "failed")
+     (t "partial"))))
+
+(defun sgn-chat--mark-unconfirmed (chat-id rowid)
+  "Mark sent message ROWID in CHAT-ID as unconfirmed if still sending."
+  (when (equal (plist-get (sgn-db-get-message-by-rowid rowid) :send-status)
+               "sending")
+    (sgn-chat--update-sent chat-id rowid '(:send-status "unconfirmed"))))
+
+(defun sgn-chat--update-sent (chat-id rowid attrs)
+  "Update sent message ROWID in CHAT-ID with ATTRS and re-render it."
+  (when rowid
+    (sgn-db-update-message rowid attrs)
+    (when-let* ((buf (get-buffer
+                      (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
+      (with-current-buffer buf
+        (sgn-chat-update-message rowid)))))
 
 (defun sgn-chat--persist-and-render-sent (chat-id body styles-json
                                                    quote-ts quote-author
                                                    quote-body)
-  "Persist and render a sent message optimistically.
+  "Persist and render a sent message as sending.
 CHAT-ID, BODY, STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and
 QUOTE-BODY describe the message.  Return the new rowid."
   (let* ((timestamp (truncate (* (float-time) 1000)))
@@ -450,7 +499,8 @@ QUOTE-BODY describe the message.  Return the new rowid."
                        :quote-ts quote-ts
                        :quote-author quote-author
                        :quote-body quote-body
-                       :styles-json styles-json))))
+                       :styles-json styles-json
+                       :send-status "sending"))))
     (sgn-db-upsert-chat chat-id :last-msg-ts timestamp)
     (when rowid
       (let ((msg (sgn-db-get-message-by-rowid rowid)))
@@ -696,6 +746,7 @@ Handles grouping, headers, body, quotes, reactions, and media."
          (quote-author (plist-get msg :quote-author))
          (quote-body (plist-get msg :quote-body))
          (styles-json (plist-get msg :styles-json))
+         (send-status (plist-get msg :send-status))
          (target-author sender)
          (start (point)))
     ;; Quote block
@@ -712,6 +763,7 @@ Handles grouping, headers, body, quotes, reactions, and media."
         (insert "  " styled-text)
         (when (and edited-at (not (zerop edited-at)))
           (insert (propertize " (edited)" 'face 'sgn-timestamp-face)))
+        (sgn-chat--insert-send-status send-status)
         (insert "\n")))
      (t
       ;; Media-only message, no text body
@@ -762,6 +814,13 @@ Handles grouping, headers, body, quotes, reactions, and media."
     (put-text-property start (point) 'read-only t)
     (put-text-property start (point) 'keymap sgn-chat-message-map)
     (put-text-property start (point) 'rear-nonsticky '(read-only keymap))))
+
+(defun sgn-chat--insert-send-status (status)
+  "Insert the label for send STATUS, if it has one.
+See `sgn-chat--send-status-labels'."
+  (when-let* ((entry (assoc status sgn-chat--send-status-labels)))
+    (insert (propertize (format " (%s)" (nth 1 entry))
+                        'face (nth 2 entry)))))
 
 (defun sgn-chat--render-quote (author body)
   "Render a quote block for AUTHOR with BODY."

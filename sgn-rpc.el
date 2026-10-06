@@ -41,6 +41,7 @@
 
 (require 'json)
 (require 'cl-lib)
+(require 'subr-x)
 
 (declare-function sgn--log "sgn")
 (declare-function sgn-start "sgn")
@@ -100,6 +101,11 @@ If nil, errors are logged but not reported to a buffer.")
 Each callback is called with the result value when a successful
 response arrives for that ID.")
 
+(defvar sgn-rpc--pending-error-callbacks (make-hash-table :test 'equal)
+  "Mapping of RPC request ID to error callback function.
+Each callback is called with the error object when the request
+fails for good, or when signal-cli stops before replying.")
+
 (defvar sgn-rpc--request-methods (make-hash-table :test 'equal)
   "Mapping of RPC request ID to method name.
 Used by the error handler to determine whether a failed request
@@ -152,10 +158,7 @@ mode, signal-cli receives messages automatically."
   (setq sgn-rpc--partial-line "")
   (setq sgn-rpc--last-output nil)
   (sgn-rpc--set-failure nil)
-  (clrhash sgn-rpc--pending-callbacks)
-  (clrhash sgn-rpc--request-methods)
-  (clrhash sgn-rpc--request-params)
-  (clrhash sgn-rpc--retried-ids)
+  (sgn-rpc--abandon-pending)
   ;; Start the process.  It must use a pipe: a pty's line discipline
   ;; drops input beyond 1024 bytes per line on macOS, so a long
   ;; request (such as a reply quoting a long message) would never
@@ -179,7 +182,24 @@ mode, signal-cli receives messages automatically."
   (when (get-process sgn-rpc--process-name)
     (delete-process sgn-rpc--process-name)
     (sgn--log "sgn RPC process stopped.")
-    (message "sgn service stopped.")))
+    (message "sgn service stopped."))
+  (sgn-rpc--abandon-pending))
+
+(defun sgn-rpc--abandon-pending ()
+  "Forget all pending requests, calling their error callbacks first.
+signal-cli will not reply to requests sent to a process that has
+stopped, so callers waiting on them are told they were abandoned:
+the error object passed to their error callbacks has a non-nil
+`abandoned' entry."
+  (let ((error-callbacks (hash-table-values sgn-rpc--pending-error-callbacks)))
+    (clrhash sgn-rpc--pending-callbacks)
+    (clrhash sgn-rpc--pending-error-callbacks)
+    (clrhash sgn-rpc--request-methods)
+    (clrhash sgn-rpc--request-params)
+    (clrhash sgn-rpc--retried-ids)
+    (dolist (callback error-callbacks)
+      (funcall callback '((message . "signal-cli stopped before replying")
+                          (abandoned . t))))))
 
 (defun sgn-rpc-alive-p ()
   "Return non-nil if the signal-cli JSON-RPC process is running."
@@ -188,12 +208,14 @@ mode, signal-cli receives messages automatically."
 
 ;;; Generic send
 
-(defun sgn-rpc-send (method params &optional callback)
+(defun sgn-rpc-send (method params &optional callback error-callback)
   "Send a JSON-RPC request with METHOD and PARAMS.
 Return the integer request ID.  If CALLBACK is non-nil, it is
 called with the result value when a successful response arrives.
-The method name is stored alongside the callback so the error
-handler can determine retry eligibility."
+If ERROR-CALLBACK is non-nil, it is called with the error object
+when the request fails for good or signal-cli stops before
+replying.  The method name is stored alongside the callback so
+the error handler can determine retry eligibility."
   (unless (sgn-rpc-alive-p)
     (sgn-rpc--ensure-running))
   (let* ((id (cl-incf sgn-rpc--id-counter))
@@ -206,6 +228,8 @@ handler can determine retry eligibility."
     (puthash id params sgn-rpc--request-params)
     (when callback
       (puthash id callback sgn-rpc--pending-callbacks))
+    (when error-callback
+      (puthash id error-callback sgn-rpc--pending-error-callbacks))
     (sgn--log "SEND: %s" json-str)
     (process-send-string sgn-rpc--process-name (concat json-str "\n"))
     id))
@@ -255,11 +279,16 @@ buffer exceeds `sgn-rpc--max-partial-line-length'."
         (setq sgn-rpc--last-output line)
         (sgn--log "OUTPUT: %s" line))))))
 
-(defun sgn-rpc--process-sentinel (_proc event)
-  "Log process EVENT and report abnormal exits.
+(defun sgn-rpc--process-sentinel (proc event)
+  "Log process EVENT for PROC and report abnormal exits.
 An abnormal exit is recorded in `sgn-rpc--failure', together with
-the last text signal-cli printed."
+the last text signal-cli printed.  When the current signal-cli
+process ends, its pending requests are abandoned."
   (sgn--log "Process event: %s" (string-trim event))
+  (when (and proc
+             (not (process-live-p proc))
+             (eq proc (get-process sgn-rpc--process-name)))
+    (sgn-rpc--abandon-pending))
   (cond
    ((string-prefix-p "exited abnormally" event)
     (sgn-rpc--set-failure
@@ -329,13 +358,15 @@ their pending callback."
   "Handle a JSON-RPC error response for request ID with ERROR-OBJ.
 For transient errors on idempotent methods that have not already
 been retried, schedule a single retry after `sgn-rpc--retry-delay'
-seconds.  For permanent or non-retryable errors, report via
+seconds.  For permanent or non-retryable errors, call the
+request's error callback, if any, and report via
 `sgn-rpc-error-handler' if set, otherwise just log."
   (let* ((code (alist-get 'code error-obj))
          (msg (alist-get 'message error-obj))
          (method (gethash id sgn-rpc--request-methods))
          (params (gethash id sgn-rpc--request-params))
          (callback (gethash id sgn-rpc--pending-callbacks))
+         (error-callback (gethash id sgn-rpc--pending-error-callbacks))
          (already-retried (gethash id sgn-rpc--retried-ids)))
     (sgn--log "RPC error [id=%s method=%s code=%s]: %s" id method code msg)
     ;; Attempt retry for transient errors on idempotent methods.
@@ -348,14 +379,16 @@ seconds.  For permanent or non-retryable errors, report via
           (puthash id t sgn-rpc--retried-ids)
           ;; Clean up the old request's bookkeeping.
           (remhash id sgn-rpc--pending-callbacks)
+          (remhash id sgn-rpc--pending-error-callbacks)
           (remhash id sgn-rpc--request-methods)
           (remhash id sgn-rpc--request-params)
           (sgn--log "Scheduling retry for %s (id=%s) in %ds"
                     method id sgn-rpc--retry-delay)
           (run-at-time sgn-rpc--retry-delay nil
-                       #'sgn-rpc-send method params callback))
+                       #'sgn-rpc-send method params callback error-callback))
       ;; Not retryable: clean up and report.
       (remhash id sgn-rpc--pending-callbacks)
+      (remhash id sgn-rpc--pending-error-callbacks)
       (remhash id sgn-rpc--request-methods)
       (remhash id sgn-rpc--request-params)
       (remhash id sgn-rpc--retried-ids)
@@ -365,6 +398,8 @@ seconds.  For permanent or non-retryable errors, report via
               ((memq code sgn-rpc--permanent-error-codes) "permanent")
               (t "unknown"))))
         (sgn--log "RPC error classified as %s [code=%s]: %s" classification code msg))
+      (when error-callback
+        (funcall error-callback error-obj))
       (when sgn-rpc-error-handler
         (funcall sgn-rpc-error-handler id error-obj)))))
 
@@ -374,6 +409,7 @@ Invokes and removes the pending callback, if any, then cleans up
 all bookkeeping for this request."
   (let ((callback (gethash id sgn-rpc--pending-callbacks)))
     (remhash id sgn-rpc--pending-callbacks)
+    (remhash id sgn-rpc--pending-error-callbacks)
     (remhash id sgn-rpc--request-methods)
     (remhash id sgn-rpc--request-params)
     (remhash id sgn-rpc--retried-ids)
@@ -402,17 +438,19 @@ In jsonRpc mode signal-cli receives messages automatically."
 
 ;;; Convenience functions for specific RPC methods
 
-(defun sgn-rpc-send-message (chat-id text &optional extras callback)
+(defun sgn-rpc-send-message (chat-id text &optional extras callback
+                                     error-callback)
   "Send TEXT to CHAT-ID.
 EXTRAS is an optional alist of additional parameters (e.g.
 quoteTimestamp, quoteAuthor, editTimestamp, attachments).  If
 CALLBACK is non-nil, it is called with the result, whose
-`timestamp' is the message's Signal timestamp.
+`timestamp' is the message's Signal timestamp.  If ERROR-CALLBACK
+is non-nil, it is called with the error object if the send fails.
 Return the request ID."
   (let ((params (append (sgn-rpc--build-address chat-id)
                         `((message . ,text))
                         extras)))
-    (sgn-rpc-send "send" params callback)))
+    (sgn-rpc-send "send" params callback error-callback)))
 
 (defun sgn-rpc-send-reaction (chat-id emoji target-author target-ts &optional remove)
   "Send reaction EMOJI to message identified by TARGET-AUTHOR and TARGET-TS.

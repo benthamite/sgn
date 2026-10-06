@@ -23,6 +23,7 @@
          (sgn-rpc-failure-change-hook nil)
          (sgn-rpc--id-counter 0)
          (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
+         (sgn-rpc--pending-error-callbacks (make-hash-table :test 'equal))
          (sgn-rpc--request-methods (make-hash-table :test 'equal))
          (sgn-rpc--request-params (make-hash-table :test 'equal))
          (sgn-rpc--retried-ids (make-hash-table :test 'equal))
@@ -54,6 +55,7 @@
             (sgn-rpc--partial-line "")
             (sgn-rpc--id-counter 0)
             (sgn-rpc--pending-callbacks (make-hash-table :test 'equal))
+            (sgn-rpc--pending-error-callbacks (make-hash-table :test 'equal))
             (sgn-rpc--request-methods (make-hash-table :test 'equal))
             (sgn-rpc--request-params (make-hash-table :test 'equal))
             (sgn-rpc--retried-ids (make-hash-table :test 'equal))
@@ -781,6 +783,111 @@
                                        'sgn-message-rowid rowid)
                     'sgn-message-ts)
                    1790339121167))))))
+
+(defmacro sgn-test--with-sent-message (&rest body)
+  "Send \"hello\" from a chat buffer and run BODY.
+In BODY, `rowid' is the sent message's rowid and `label' returns
+the text of its rendering."
+  (declare (indent 0))
+  `(sgn-test-with-chat-buffer "+15551234567"
+     (cl-letf (((symbol-function 'sgn-dashboard-refresh) #'ignore)
+               ((symbol-function 'sgn-rpc-alive-p) (lambda () t))
+               ((symbol-function 'sgn--log) #'ignore)
+               ((symbol-function 'process-send-string) #'ignore)
+               ((symbol-function 'run-at-time) #'ignore))
+       (sgn-db-upsert-chat "+15551234567" :type "individual")
+       (sgn-chat--do-send "+15551234567" "hello")
+       (let ((rowid (get-text-property
+                     (text-property-not-all (point-min) (point-max)
+                                            'sgn-message-rowid nil)
+                     'sgn-message-rowid)))
+         (cl-flet ((label ()
+                     (let ((start (text-property-any (point-min) (point-max)
+                                                     'sgn-message-rowid rowid)))
+                       (buffer-substring-no-properties
+                        start (next-single-property-change
+                               start 'sgn-message-rowid)))))
+           ,@body)))))
+
+(defun sgn-test--reply (json)
+  "Dispatch the signal-cli reply JSON to request 1."
+  (sgn-rpc--dispatch (json-read-from-string json)))
+
+(ert-deftest sgn-test-sent-message-shows-sending-until-confirmed ()
+  "A sent message is labelled as sending until signal-cli confirms it."
+  (sgn-test--with-sent-message
+    (should (string-match-p "hello (sending…)" (label)))
+    (sgn-test--reply
+     (concat "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"timestamp\":1,"
+             "\"results\":[{\"type\":\"SUCCESS\"}]}}"))
+    (should (equal (plist-get (sgn-db-get-message-by-rowid rowid) :send-status)
+                   "sent"))
+    (should (equal (label) "  hello\n"))))
+
+(ert-deftest sgn-test-sent-message-shows-rpc-failure ()
+  "A send rejected by signal-cli is labelled as not sent."
+  (sgn-test--with-sent-message
+    (sgn-test--reply
+     (concat "{\"jsonrpc\":\"2.0\",\"id\":1,"
+             "\"error\":{\"code\":-1,\"message\":\"Untrusted identity\"}}"))
+    (should (string-match-p "hello (not sent)" (label)))))
+
+(ert-deftest sgn-test-sent-message-shows-recipient-failures ()
+  "Per-recipient failures in the send result are labelled."
+  (sgn-test--with-sent-message
+    (sgn-test--reply
+     (concat "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"timestamp\":1,"
+             "\"results\":[{\"type\":\"SUCCESS\"},"
+             "{\"type\":\"NETWORK_FAILURE\"}]}}"))
+    (should (string-match-p "not delivered to every recipient" (label)))))
+
+(ert-deftest sgn-test-sent-message-times-out-as-unconfirmed ()
+  "A send without a reply within the timeout is labelled unconfirmed."
+  (sgn-test--with-sent-message
+    (sgn-chat--mark-unconfirmed "+15551234567" rowid)
+    (should (string-match-p "not confirmed" (label)))
+    (sgn-test--reply
+     (concat "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"timestamp\":1,"
+             "\"results\":[{\"type\":\"SUCCESS\"}]}}"))
+    (should (equal (label) "  hello\n"))))
+
+(ert-deftest sgn-test-sent-message-unconfirmed-when-signal-cli-stops ()
+  "Stopping signal-cli before it replies leaves the message unconfirmed."
+  (sgn-test--with-sent-message
+    (cl-letf (((symbol-function 'message) #'ignore))
+      (sgn-rpc-stop))
+    (should (string-match-p "not confirmed" (label)))))
+
+(ert-deftest sgn-test-interrupted-sends-become-unconfirmed ()
+  "Sends left pending by a previous session are marked unconfirmed."
+  (sgn-test-with-db
+    (sgn-db-upsert-chat "+15551234567" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  '(:chat-id "+15551234567" :sender "+15550000000"
+                    :timestamp 1 :body "hi" :type "sync"
+                    :send-status "sending"))))
+      (sgn-db-mark-interrupted-sends)
+      (should (equal (plist-get (sgn-db-get-message-by-rowid rowid)
+                                :send-status)
+                     "unconfirmed")))))
+
+(ert-deftest sgn-test-schema-migrates-to-send-status ()
+  "A version 1 database gains the send_status column."
+  (sgn-test-with-db
+    (sqlite-execute sgn-db--connection
+                    "ALTER TABLE messages DROP COLUMN send_status")
+    (sgn-db--set-schema-version sgn-db--connection 1)
+    (sgn-db-close)
+    (sgn-db-init)
+    (should (= (sgn-db--get-schema-version sgn-db--connection) 2))
+    (sgn-db-upsert-chat "+15551234567" :type "individual")
+    (let ((rowid (sgn-db-insert-message
+                  '(:chat-id "+15551234567" :sender "+15550000000"
+                    :timestamp 1 :body "hi" :type "sync"
+                    :send-status "sending"))))
+      (should (equal (plist-get (sgn-db-get-message-by-rowid rowid)
+                                :send-status)
+                     "sending")))))
 
 (defmacro sgn-test--with-receipts (focused &rest body)
   "Run BODY capturing read receipts in `receipts', with frame focus FOCUSED."

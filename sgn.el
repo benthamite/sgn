@@ -514,6 +514,7 @@ refreshes contacts, and opens the dashboard."
     (user-error "signal-cli not found: %s" sgn-cli-program))
   ;; Initialize database
   (sgn-db-init)
+  (sgn-db-mark-interrupted-sends)
   ;; Load contacts from DB into cache
   (sgn-contacts-load-from-db)
   ;; Set up receive handler

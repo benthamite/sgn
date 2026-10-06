@@ -109,6 +109,7 @@ The user option ~sgn-enable-animation~ controls whether stickers and GIFs are an
 #+vindex: sgn-send-read-receipts
 #+vindex: sgn-cli-auto-read-receipts
 #+vindex: sgn-send-typing
+#+vindex: sgn-send-timeout
 The user option ~sgn-auto-open-buffer~ controls whether a chat buffer is automatically displayed when an incoming message arrives.  The default is ~nil~, meaning new messages only update the unread count and trigger notifications.  Set this to ~t~ if you want Emacs to switch to the relevant chat buffer on each incoming message.
 
 The user option ~sgn-send-read-receipts~ controls whether =sgn= sends read receipts via ~sendReceipt~ when a chat buffer is visible and focused.  The default is ~t~.  This is /focus-gated/: receipts are only sent when you are actually looking at the chat, preserving your privacy when you have a chat buffer open but unfocused.  A chat is marked read, and receipts are sent for its unread messages, whenever it is shown in the selected window of a focused frame: when you switch to it by any means, when Emacs regains focus, or when a message arrives while you are looking at it.  =signal-cli= also syncs these receipts to your other linked devices, so messages you read in Emacs show as read on your phone.  Reactions, edits, and deletions do not count as unread messages.
@@ -116,6 +117,8 @@ The user option ~sgn-send-read-receipts~ controls whether =sgn= sends read recei
 The user option ~sgn-cli-auto-read-receipts~ controls whether the =--send-read-receipts= flag is passed to =signal-cli= at the process level.  The default is ~nil~.  When enabled, =signal-cli= sends read receipts for /every/ incoming data message regardless of Emacs focus.  Most users should leave this off and rely on ~sgn-send-read-receipts~ instead.
 
 The user option ~sgn-send-typing~ controls whether typing indicators are sent to your chat partner while you compose a message.  The default is ~t~.  A start indicator is sent when you begin typing and repeated every ten seconds while you keep typing; a stop indicator is sent after five seconds without typing, or when you send the message.
+
+The user option ~sgn-send-timeout~ specifies how many seconds to wait for =signal-cli= to confirm a sent message.  The default is 30.  A message still unconfirmed after this long is labelled /not confirmed/ in the chat buffer; the label disappears if confirmation arrives later.
 
 ** Linking
 :PROPERTIES:
@@ -192,7 +195,7 @@ The command ~sgn-dashboard~ opens the chat list buffer ([[#h:dashboard][Dashboar
 #+findex: sgn-chat-send-input
 #+findex: sgn-attach-file
 #+findex: sgn-send-voice-note
-The command ~sgn-chat-send-input~ sends the text in the input area to the current chat.  If the =sgn= service is not already running, sending starts it before issuing the RPC request.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (=*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, =||spoiler||=) is parsed into Signal style ranges before sending.  Bound to ~RET~ in chat buffers.
+The command ~sgn-chat-send-input~ sends the text in the input area to the current chat.  If the =sgn= service is not already running, sending starts it before issuing the RPC request.  If a reply is in progress, the message is sent as a quoted reply; if an edit is in progress, the message replaces the original.  Lightweight markup in the input (=*bold*=, =_italic_=, =~strikethrough~=, =`monospace`=, =||spoiler||=) is parsed into Signal style ranges before sending. A sent message is labelled /sending…/ until =signal-cli= confirms it, after which the label disappears.  If =signal-cli= rejects the message, it is labelled /not sent/; if some group members did not receive it, /not delivered to every recipient/; and if no confirmation arrives within ~sgn-send-timeout~ seconds, or =signal-cli= stops first, /not confirmed: may not have been sent/.  Bound to ~RET~ in chat buffers.
 
 The command ~sgn-attach-file~ sends a file as an attachment to the current chat.  It prompts for a file path interactively.  Bound to ~C-c C-a~.
 

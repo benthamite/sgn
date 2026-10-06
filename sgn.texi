@@ -194,6 +194,7 @@ The user option @code{sgn-enable-animation} controls whether stickers and GIFs a
 @vindex sgn-send-read-receipts
 @vindex sgn-cli-auto-read-receipts
 @vindex sgn-send-typing
+@vindex sgn-send-timeout
 The user option @code{sgn-auto-open-buffer} controls whether a chat buffer is automatically displayed when an incoming message arrives.  The default is @code{nil}@comma{} meaning new messages only update the unread count and trigger notifications.  Set this to @code{t} if you want Emacs to switch to the relevant chat buffer on each incoming message. @*
 
 The user option @code{sgn-send-read-receipts} controls whether @samp{sgn} sends read receipts via @code{sendReceipt} when a chat buffer is visible and focused.  The default is @code{t}.  This is @emph{focus-gated}: receipts are only sent when you are actually looking at the chat@comma{} preserving your privacy when you have a chat buffer open but unfocused.  A chat is marked read@comma{} and receipts are sent for its unread messages@comma{} whenever it is shown in the selected window of a focused frame: when you switch to it by any means@comma{} when Emacs regains focus@comma{} or when a message arrives while you are looking at it.  @samp{signal-cli} also syncs these receipts to your other linked devices@comma{} so messages you read in Emacs show as read on your phone.  Reactions@comma{} edits@comma{} and deletions do not count as unread messages. @*
@@ -201,6 +202,8 @@ The user option @code{sgn-send-read-receipts} controls whether @samp{sgn} sends 
 The user option @code{sgn-cli-auto-read-receipts} controls whether the @samp{--send-read-receipts} flag is passed to @samp{signal-cli} at the process level.  The default is @code{nil}.  When enabled@comma{} @samp{signal-cli} sends read receipts for @emph{every} incoming data message regardless of Emacs focus.  Most users should leave this off and rely on @code{sgn-send-read-receipts} instead. @*
 
 The user option @code{sgn-send-typing} controls whether typing indicators are sent to your chat partner while you compose a message.  The default is @code{t}.  A start indicator is sent when you begin typing and repeated every ten seconds while you keep typing; a stop indicator is sent after five seconds without typing@comma{} or when you send the message. @*
+
+The user option @code{sgn-send-timeout} specifies how many seconds to wait for @samp{signal-cli} to confirm a sent message.  The default is 30.  A message still unconfirmed after this long is labelled @emph{not confirmed} in the chat buffer; the label disappears if confirmation arrives later. @*
 
 @node Linking
 @section Linking
@@ -279,7 +282,7 @@ The command @code{sgn-dashboard} opens the chat list buffer (@ref{Dashboard, , D
 @findex sgn-chat-send-input
 @findex sgn-attach-file
 @findex sgn-send-voice-note
-The command @code{sgn-chat-send-input} sends the text in the input area to the current chat.  If the @samp{sgn} service is not already running@comma{} sending starts it before issuing the RPC request.  If a reply is in progress@comma{} the message is sent as a quoted reply; if an edit is in progress@comma{} the message replaces the original.  Lightweight markup in the input (@samp{*bold*}@comma{} @samp{_italic_}@comma{} @samp{~strikethrough~}@comma{} @samp{`monospace`}@comma{} @samp{||spoiler||}) is parsed into Signal style ranges before sending.  Bound to @code{RET} in chat buffers. @*
+The command @code{sgn-chat-send-input} sends the text in the input area to the current chat.  If the @samp{sgn} service is not already running@comma{} sending starts it before issuing the RPC request.  If a reply is in progress@comma{} the message is sent as a quoted reply; if an edit is in progress@comma{} the message replaces the original.  Lightweight markup in the input (@samp{*bold*}@comma{} @samp{_italic_}@comma{} @samp{~strikethrough~}@comma{} @samp{`monospace`}@comma{} @samp{||spoiler||}) is parsed into Signal style ranges before sending. A sent message is labelled @emph{sending…} until @samp{signal-cli} confirms it@comma{} after which the label disappears.  If @samp{signal-cli} rejects the message@comma{} it is labelled @emph{not sent}; if some group members did not receive it@comma{} @emph{not delivered to every recipient}; and if no confirmation arrives within @code{sgn-send-timeout} seconds@comma{} or @samp{signal-cli} stops first@comma{} @emph{not confirmed: may not have been sent}.  Bound to @code{RET} in chat buffers. @*
 
 The command @code{sgn-attach-file} sends a file as an attachment to the current chat.  It prompts for a file path interactively.  Bound to @code{C-c C-a}. @*
 

@@ -643,9 +643,16 @@ LIMIT defaults to 50.  Messages past their expiry are left out."
         (cons timestamp self-ids))))
 
 (defun sgn-db-mark-deleted (rowid)
-  "Mark message ROWID deleted and drop its content and media.
+  "Mark message ROWID deleted and drop its content, media, reactions and pin.
 Return its media, whose files the caller may delete."
   (let ((media (sgn-db-get-media rowid)))
+    (dolist (table '("reactions" "pins"))
+      (sgn-db-execute
+       (format "DELETE FROM %s WHERE (chat_id, target_author, target_timestamp)
+                IN (SELECT chat_id, sender, timestamp FROM messages
+                    WHERE rowid = ?)"
+               table)
+       (list rowid)))
     (sgn-db-execute
      "UPDATE messages SET deleted = 1, body = NULL, styles_json = NULL,
              mentions_json = NULL, quote_body = NULL, raw_json = NULL

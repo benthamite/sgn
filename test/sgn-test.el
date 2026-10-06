@@ -551,6 +551,8 @@ and a delete that arrives first applies when the message does."
       (with-temp-file file (insert "x"))
       (sgn-test-receive (sgn-test-incoming "photo" 1000
                                            :attachments (list (sgn-test-attachment "pic.jpg"))))
+      (sgn-db-set-reaction sgn-test-alice-uuid sgn-test-alice-uuid 1000
+                           sgn-test-bob-uuid "👍" 1)
       ;; Bob cannot delete Alice's message.
       (sgn-test-receive (sgn-test-envelope
                          :number sgn-test-bob-number :uuid sgn-test-bob-uuid
@@ -561,6 +563,8 @@ and a delete that arrives first applies when the message does."
       (let ((msg (car (sgn-test-chat-messages sgn-test-alice-uuid))))
         (should (eql (plist-get msg :deleted) 1))
         (should-not (plist-get msg :body))
+        (should-not (sgn-db-get-reactions sgn-test-alice-uuid
+                                          sgn-test-alice-uuid 1000))
         (should-not (sgn-db-get-media (plist-get msg :rowid))))
       (should-not (file-exists-p file))
       (sgn-test-receive (sgn-test-incoming nil 4000 :remote-delete 3000))

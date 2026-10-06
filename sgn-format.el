@@ -5,39 +5,28 @@
 ;; Author: Keenan Salandy <keenan@salandy.dev>
 ;; Maintainer: Pablo Stafforini <pablo@stafforini.com>
 
-;; This file is NOT a part of GNU Emacs.
-
-;; This program is free software; you can redistribute it and/or modify
-;; it under the terms of the GNU General Public License as published by
-;; the Free Software Foundation, either version 3 of the License, or
-;; (at your option) any later version.
-;;
-;; This program is distributed in the hope that it will be useful,
-;; but WITHOUT ANY WARRANTY; without even the implied warranty of
-;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-;; GNU General Public License for more details.
-;;
-;; You should have received a copy of the GNU General Public License
-;; along with this program.  If not, see <https://www.gnu.org/licenses/>.
+;; This file is NOT part of GNU Emacs.
 
 ;;; Commentary:
 
-;; Text formatting for sgn, the Emacs Signal client.  Handles two
-;; concerns:
+;; Signal text formatting: rendering incoming style ranges and
+;; mentions, and parsing lightweight markup typed in Emacs into style
+;; ranges.
 ;;
-;; 1. Rendering incoming styles — Signal sends text style ranges as
-;;    JSON objects with `start', `length', and `style' keys.  This
-;;    module applies the corresponding Emacs faces to rendered text.
-;;
-;; 2. Composing outgoing markup — users type lightweight markup
-;;    (*bold*, _italic_, ~strikethrough~, `monospace`, ||spoiler||)
-;;    in the input area, and this module parses it into plain text
-;;    plus Signal style ranges for sending.
+;; Signal measures style and mention ranges in UTF-16 code units, so
+;; every character outside the Basic Multilingual Plane, such as most
+;; emoji, counts as two.  Ranges are kept in those units everywhere
+;; outside this file and converted to Emacs character positions only
+;; here.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'json)
+
+(declare-function sgn-contacts-get-name "sgn-contacts")
+(declare-function sgn-store-self-p "sgn-store")
 
 ;;;; Faces
 
@@ -48,7 +37,7 @@
   :group 'sgn)
 
 (defface sgn-spoiler-revealed-face
-  '((t :inherit default :background "#e0e0e0"))
+  '((t :inherit highlight))
   "Face for revealed spoiler text."
   :group 'sgn)
 
@@ -62,364 +51,317 @@
   "Face for monospace text."
   :group 'sgn)
 
-;;;; Constants
+(defface sgn-mention-face
+  '((t :inherit link :underline nil))
+  "Face for mentions of other people."
+  :group 'sgn)
 
-(defconst sgn-format--style-face-alist
+(defface sgn-mention-self-face
+  '((t :inherit match))
+  "Face for mentions of you."
+  :group 'sgn)
+
+;;;; UTF-16 offsets
+
+(defun sgn-format--utf16-width (char)
+  "Return the number of UTF-16 code units CHAR takes."
+  (if (> char #xFFFF) 2 1))
+
+(defun sgn-format-utf16-to-char (string offset)
+  "Return the character position in STRING at UTF-16 OFFSET.
+An OFFSET beyond the end of STRING gives its length."
+  (let ((units 0) (pos 0) (len (length string)))
+    (while (and (< pos len) (< units offset))
+      (cl-incf units (sgn-format--utf16-width (aref string pos)))
+      (cl-incf pos))
+    pos))
+
+(defun sgn-format-char-to-utf16 (string pos)
+  "Return the UTF-16 offset of character position POS in STRING."
+  (cl-loop for i below (min pos (length string))
+           sum (sgn-format--utf16-width (aref string i))))
+
+;;;; Rendering
+
+(defconst sgn-format--style-faces
   '(("BOLD" . bold)
     ("ITALIC" . italic)
     ("STRIKETHROUGH" . sgn-strikethrough-face)
     ("MONOSPACE" . sgn-monospace-face)
     ("SPOILER" . sgn-spoiler-face))
-  "Mapping from Signal style names to Emacs faces.")
+  "Mapping from Signal style names to faces.")
 
-(defconst sgn-format--markup-rules
-  '(("||" . "SPOILER")
-    ("*"  . "BOLD")
-    ("_"  . "ITALIC")
-    ("~"  . "STRIKETHROUGH")
-    ("`"  . "MONOSPACE"))
-  "Alist mapping markup delimiters to Signal style names.
-The two-character delimiter || must come first so the parser
-checks it before the single-character delimiters.")
+(defun sgn-format-read-ranges (json)
+  "Return the ranges stored in JSON as (NAME START LENGTH) lists.
+JSON holds a list of such lists; older databases hold objects with
+`style' or `uuid', `start' and `length' keys instead."
+  (when (and json (not (string-empty-p json)))
+    (mapcar (lambda (range)
+              (if (and (consp range) (consp (car range)))
+                  (list (or (alist-get 'style range) (alist-get 'uuid range))
+                        (alist-get 'start range) (alist-get 'length range))
+                range))
+            (json-parse-string json :object-type 'alist :array-type 'list
+                               :null-object nil :false-object nil))))
 
-;;;; Rendering incoming styles
+(defun sgn-format-ranges-to-json (ranges)
+  "Return RANGES, a list of (NAME START LENGTH), as JSON, or nil if empty."
+  (when ranges
+    (json-encode (vconcat (mapcar #'vconcat ranges)))))
 
-(defun sgn-format-apply-styles (text styles-json)
-  "Apply Signal text styles to TEXT string.
-STYLES-JSON is a JSON string encoding an array of style objects,
-each with `start', `length', and `style' keys.
-Return a propertized copy of TEXT with appropriate faces applied.
-If STYLES-JSON is nil or empty, return TEXT unchanged.
-Styles may overlap; all applicable faces are combined."
-  (if (or (null styles-json)
-          (string-empty-p styles-json))
-      text
-    (let* ((json-array-type 'list)
-           (json-object-type 'alist)
-           (styles (condition-case nil
-                       (json-read-from-string styles-json)
-                     (error nil))))
-      (if (null styles)
-          text
-        (let ((result (copy-sequence text)))
-          (dolist (style-obj styles)
-            (sgn-format--apply-one-style result style-obj))
-          result)))))
+(defun sgn-format-render (body styles mentions &optional revealed)
+  "Return BODY with STYLES and MENTIONS applied.
+STYLES is a list of (STYLE START LENGTH) and MENTIONS of (PERSON
+START LENGTH), in UTF-16 units.  Mentions are replaced by @NAME.
+Spoilers are concealed unless REVEALED is non-nil."
+  (let ((text (copy-sequence body)))
+    (pcase-dolist (`(,style ,start ,length) styles)
+      (sgn-format--apply-style text style start length revealed))
+    (dolist (mention (sort (copy-sequence mentions)
+                           (lambda (a b) (> (nth 1 a) (nth 1 b)))))
+      (setq text (sgn-format--apply-mention text body mention)))
+    text))
 
-(defun sgn-format--apply-one-style (text style-obj)
-  "Apply a single STYLE-OBJ to propertized TEXT in place.
-STYLE-OBJ is an alist with `start', `length', and `style' keys.
-Adds the corresponding face and, for spoilers, also sets the
-`sgn-spoiler' text property."
-  (let* ((start (alist-get 'start style-obj))
-         (length (alist-get 'length style-obj))
-         (style-name (alist-get 'style style-obj))
-         (face (cdr (assoc style-name sgn-format--style-face-alist)))
-         (end (min (+ start length) (length text))))
-    (when (and face (< start (length text)))
-      (add-face-text-property start end face nil text)
-      (when (equal style-name "SPOILER")
-        (put-text-property start end 'sgn-spoiler t text)))))
+(defun sgn-format--apply-style (text style start length revealed)
+  "Apply STYLE to the range START, LENGTH of TEXT, in UTF-16 units.
+A spoiler is concealed unless REVEALED is non-nil."
+  (let* ((beg (sgn-format-utf16-to-char text start))
+         (end (sgn-format-utf16-to-char text (+ start length)))
+         (face (if (and revealed (equal style "SPOILER"))
+                   'sgn-spoiler-revealed-face
+                 (cdr (assoc style sgn-format--style-faces)))))
+    (when (and face (< beg end))
+      (add-face-text-property beg end face nil text)
+      (when (equal style "SPOILER")
+        (put-text-property beg end 'sgn-spoiler t text)))))
 
-(defun sgn-format-reveal-spoiler-at-point ()
-  "Reveal the spoiler text at point by changing its face.
-Interactive command — bound in chat mode.  Finds the contiguous
-region of the `sgn-spoiler' text property at point and replaces
-`sgn-spoiler-face' with `sgn-spoiler-revealed-face'."
-  (interactive)
-  (unless (get-text-property (point) 'sgn-spoiler)
-    (user-error "No spoiler at point"))
-  (let* ((beg (sgn-format--property-region-start (point) 'sgn-spoiler))
-         (end (sgn-format--property-region-end (point) 'sgn-spoiler))
-         (inhibit-read-only t))
-    (sgn-format--swap-face beg end 'sgn-spoiler-face 'sgn-spoiler-revealed-face)))
+(defun sgn-format--apply-mention (text body mention)
+  "Return TEXT with MENTION replaced by the mentioned person's name.
+MENTION is (PERSON START LENGTH) in UTF-16 units of BODY, which
+has the same characters as TEXT."
+  (pcase-let* ((`(,person ,start ,length) mention)
+               (beg (sgn-format-utf16-to-char body start))
+               (end (sgn-format-utf16-to-char body (+ start length))))
+    (if (and person (< beg end) (<= end (length text)))
+        (concat (substring text 0 beg)
+                (propertize (concat "@" (sgn-contacts-get-name person))
+                            'face (if (sgn-store-self-p person)
+                                      'sgn-mention-self-face
+                                    'sgn-mention-face))
+                (substring text end))
+      text)))
 
-(defun sgn-format--property-region-start (pos prop)
-  "Return the start of the contiguous region with PROP around POS."
-  (if (and (> pos (point-min))
-           (get-text-property (1- pos) prop))
-      (previous-single-property-change pos prop)
-    pos))
+;;;; Parsing markup
 
-(defun sgn-format--property-region-end (pos prop)
-  "Return the end of the contiguous region with PROP around POS."
-  (if (get-text-property pos prop)
-      (or (next-single-property-change pos prop) (point-max))
-    pos))
-
-(defun sgn-format--swap-face (beg end old-face new-face)
-  "In the region BEG to END, replace OLD-FACE with NEW-FACE.
-Walks the region character by character, replacing OLD-FACE in
-the `face' property with NEW-FACE while preserving other faces."
-  (let ((pos beg))
-    (while (< pos end)
-      (let* ((current (get-text-property pos 'face))
-             (replaced (sgn-format--replace-face-in-spec current old-face new-face)))
-        (put-text-property pos (1+ pos) 'face replaced))
-      (setq pos (1+ pos)))))
-
-(defun sgn-format--replace-face-in-spec (spec old-face new-face)
-  "Replace OLD-FACE with NEW-FACE in face SPEC.
-SPEC may be a single face, a list of faces, or nil."
-  (cond
-   ((null spec) new-face)
-   ((eq spec old-face) new-face)
-   ((listp spec)
-    (mapcar (lambda (f) (if (eq f old-face) new-face f)) spec))
-   (t spec)))
-
-;;;; Composing outgoing markup
+(defconst sgn-format--markup
+  '(("`" . "MONOSPACE")
+    ("||" . "SPOILER")
+    ("*" . "BOLD")
+    ("_" . "ITALIC")
+    ("~" . "STRIKETHROUGH"))
+  "Markup delimiters and their styles, in the order they are parsed.
+Text inside monospace spans is not parsed for other markup.")
 
 (defun sgn-format-parse-markup (text)
   "Parse lightweight markup in TEXT.
-Return a plist (:text PLAIN-TEXT :styles STYLES-ALIST-LIST).
-PLAIN-TEXT has markup delimiters removed.
-STYLES-ALIST-LIST is a list of alists, each with keys `start',
-`length', `style'.
+Return a plist (:text PLAIN :styles STYLES), where PLAIN is TEXT
+without the markup and STYLES a list of (STYLE START LENGTH) in
+UTF-16 units of PLAIN.
 
-Markup rules:
-- *bold* → BOLD (delimiter: single *)
-- _italic_ → ITALIC (delimiter: single _)
-- ~strikethrough~ → STRIKETHROUGH (delimiter: single ~)
-- `monospace` → MONOSPACE (delimiter: single `)
-- ||spoiler|| → SPOILER (delimiter: double ||)
+`*bold*', `_italic_', `~strikethrough~', `` `monospace` '' and
+`||spoiler||' are recognized.  An opening delimiter must start a
+word and be followed by a non-blank; a closing one must follow a
+non-blank and end a word, so `snake_case' and `2*3*4' are left
+alone.  URLs are never parsed.  A delimiter preceded by a
+backslash is literal, and the backslash is dropped."
+  (let ((protected (sgn-format--url-mask text))
+        (pairs nil))
+    (dolist (rule sgn-format--markup)
+      (setq pairs (nconc pairs (sgn-format--find-pairs
+                                text (car rule) (cdr rule) protected))))
+    (sgn-format--strip-markup text pairs)))
 
-Delimiters must not be preceded/followed by whitespace on the
-inner side.  Nested markup is supported (styles may overlap).
-Unmatched delimiters are left as literal characters."
-  (let ((ranges nil)
-        (all-ranges nil))
-    ;; Collect raw ranges for each delimiter type independently.
-    ;; Each range is recorded as positions in the ORIGINAL text.
-    (dolist (rule sgn-format--markup-rules)
-      (let ((delim (car rule))
-            (style (cdr rule)))
-        (setq ranges (sgn-format--find-pairs text delim style))
-        (setq all-ranges (nconc all-ranges ranges))))
-    ;; Sort ranges by their opening delimiter position (earliest first),
-    ;; breaking ties by putting longer delimiters first.
-    (setq all-ranges
-          (sort all-ranges
-                (lambda (a b)
-                  (let ((a-open (plist-get a :open-start))
-                        (b-open (plist-get b :open-start)))
-                    (or (< a-open b-open)
-                        (and (= a-open b-open)
-                             (> (plist-get a :delim-len)
-                                (plist-get b :delim-len))))))))
-    ;; Build the output: remove delimiters, compute final positions.
-    (sgn-format--build-output text all-ranges)))
+(defun sgn-format--url-mask (text)
+  "Return a bool-vector marking the characters of URLs in TEXT."
+  (let ((mask (make-bool-vector (length text) nil))
+        (start 0))
+    (while (string-match "\\(?:https?://\\|www\\.\\)[^[:space:]]+" text start)
+      (cl-loop for i from (match-beginning 0) below (match-end 0)
+               do (aset mask i t))
+      (setq start (match-end 0)))
+    mask))
 
-(defun sgn-format--find-pairs (text delim style)
-  "Find all matched pairs of DELIM in TEXT for STYLE.
-Return a list of plists, each with :open-start, :open-end,
-:close-start, :close-end, :delim-len, and :style.
-Scans left-to-right, greedily matching opening and closing
-delimiters.  Skips escaped delimiters (preceded by backslash).
-The inner side of a delimiter must not be whitespace."
-  (let ((dlen (length delim))
-        (tlen (length text))
+(defun sgn-format--word-char-p (char)
+  "Return non-nil if CHAR is a letter or digit."
+  (and char (string-match-p "\\`[[:alnum:]]\\'" (string char))))
+
+(defun sgn-format--blank-p (char)
+  "Return non-nil if CHAR is nil or whitespace."
+  (or (null char) (memq char '(?\s ?\t ?\n ?\r))))
+
+(defun sgn-format--char (text pos)
+  "Return the character of TEXT at POS, or nil outside it."
+  (and (>= pos 0) (< pos (length text)) (aref text pos)))
+
+(defun sgn-format--delimiter-at-p (text pos delim protected)
+  "Return non-nil if DELIM occurs in TEXT at POS outside PROTECTED.
+A delimiter that is part of a longer run of its character, as in
+`**', does not count."
+  (let ((len (length delim))
+        (char (aref delim 0)))
+    (and (<= (+ pos len) (length text))
+         (string= (substring text pos (+ pos len)) delim)
+         (cl-loop for i from pos below (+ pos len) never (aref protected i))
+         (not (eq (sgn-format--char text (1- pos)) char))
+         (not (eq (sgn-format--char text (+ pos len)) char)))))
+
+(defun sgn-format--before (text pos)
+  "Return the character before POS in TEXT, skipping an escaping backslash."
+  (let ((prev (sgn-format--char text (1- pos))))
+    (if (eq prev ?\\) (sgn-format--char text (- pos 2)) prev)))
+
+(defun sgn-format--opener-p (text pos delim protected)
+  "Return non-nil if DELIM at POS in TEXT can open a styled span."
+  (and (sgn-format--delimiter-at-p text pos delim protected)
+       (not (sgn-format--word-char-p (sgn-format--before text pos)))
+       (not (sgn-format--blank-p
+             (sgn-format--char text (+ pos (length delim)))))))
+
+(defun sgn-format--closer-p (text pos delim protected)
+  "Return non-nil if DELIM at POS in TEXT can close a styled span."
+  (and (sgn-format--delimiter-at-p text pos delim protected)
+       (not (sgn-format--blank-p (sgn-format--before text pos)))
+       (not (sgn-format--word-char-p
+             (sgn-format--char text (+ pos (length delim)))))))
+
+(defun sgn-format--find-pairs (text delim style protected)
+  "Return the matched DELIM pairs in TEXT, styled STYLE.
+Characters marked in PROTECTED are skipped; the delimiters of each
+pair found, and for monospace its content, are marked in turn.
+Each pair is a plist with :open, :close, :len, :style and
+:escaped, which is non-nil if either delimiter is backslashed."
+  (let ((len (length delim))
         (pos 0)
-        (result nil)
-        (open-pos nil))
-    (while (< pos tlen)
-      (cond
-       ;; Skip escaped delimiters.
-       ((and (eq (aref text pos) ?\\)
-             (< (+ pos 1) tlen)
-             (<= (+ pos 1 dlen) tlen)
-             (string= (substring text (+ pos 1) (+ pos 1 dlen)) delim))
-        (setq pos (+ pos 1 dlen)))
-       ;; Check for delimiter match at this position.
-       ((and (<= (+ pos dlen) tlen)
-             (string= (substring text pos (+ pos dlen)) delim))
-        (if open-pos
-            ;; Closing delimiter: inner side is character before this pos.
-            ;; The character just before the closing delimiter must not be whitespace.
-            (let ((before-close (aref text (1- pos))))
-              (if (memq before-close '(?\s ?\t ?\n))
-                  ;; Not a valid close; treat as new opening.
-                  (setq open-pos pos
-                        pos (+ pos dlen))
-                ;; Valid close.
-                (push (list :open-start open-pos
-                            :open-end (+ open-pos dlen)
-                            :close-start pos
-                            :close-end (+ pos dlen)
-                            :delim-len dlen
-                            :style style)
-                      result)
-                (setq open-pos nil
-                      pos (+ pos dlen))))
-          ;; Opening delimiter: inner side is character after the delimiter.
-          ;; The character just after the opening delimiter must not be whitespace.
-          (if (and (< (+ pos dlen) tlen)
-                   (not (memq (aref text (+ pos dlen)) '(?\s ?\t ?\n))))
-              (setq open-pos pos
-                    pos (+ pos dlen))
-            ;; Not valid opening; skip past it.
-            (setq pos (+ pos dlen)))))
-       (t (setq pos (1+ pos)))))
-    (nreverse result)))
+        (pairs nil))
+    (while (< pos (length text))
+      (if-let* (((sgn-format--opener-p text pos delim protected))
+                (close (cl-loop for j from (+ pos len 1) below (length text)
+                                when (sgn-format--closer-p text j delim protected)
+                                return j)))
+          (progn
+            (push (list :open pos :close close :len len :style style
+                        :escaped (or (eq (sgn-format--char text (1- pos)) ?\\)
+                                     (eq (sgn-format--char text (1- close)) ?\\)))
+                  pairs)
+            (cl-loop for i from pos below (+ close len)
+                     when (or (equal style "MONOSPACE")
+                              (< i (+ pos len)) (>= i close))
+                     do (aset protected i t))
+            (setq pos (+ close len)))
+        (cl-incf pos)))
+    (nreverse pairs)))
 
-(defun sgn-format--build-output (text ranges)
-  "Remove delimiters from TEXT based on RANGES and compute final style positions.
-RANGES is a sorted list of plists describing matched delimiter pairs.
-Return a plist (:text PLAIN-TEXT :styles STYLES-ALIST-LIST)."
-  (if (null ranges)
-      (let ((cleaned (sgn-format--unescape-delimiters text)))
-        (list :text cleaned :styles nil))
-    ;; Collect all delimiter intervals to remove, sorted by position.
-    (let* ((removals (sgn-format--collect-removals ranges))
-           (cleaned (sgn-format--remove-intervals text removals))
-           (styles (sgn-format--compute-styles ranges removals)))
-      ;; Unescape any remaining backslash-escaped delimiters.
-      (let* ((unescape-result (sgn-format--unescape-with-offsets cleaned))
-             (final-text (car unescape-result))
-             (escape-offsets (cdr unescape-result))
-             (final-styles (sgn-format--adjust-styles-for-escapes
-                            styles escape-offsets)))
-        (list :text final-text :styles final-styles)))))
-
-(defun sgn-format--collect-removals (ranges)
-  "Collect all delimiter intervals to remove from RANGES.
-Return a sorted list of (start . end) pairs."
-  (let ((removals nil))
-    (dolist (r ranges)
-      (push (cons (plist-get r :open-start) (plist-get r :open-end)) removals)
-      (push (cons (plist-get r :close-start) (plist-get r :close-end)) removals))
-    (sort removals (lambda (a b) (< (car a) (car b))))))
+(defun sgn-format--strip-markup (text pairs)
+  "Remove the markup of PAIRS from TEXT and compute the styles.
+An escaped pair loses its backslashes but keeps its delimiters."
+  (let ((removals nil)
+        (spans nil))
+    (dolist (pair pairs)
+      (let ((open (plist-get pair :open))
+            (close (plist-get pair :close))
+            (len (plist-get pair :len)))
+        (if (plist-get pair :escaped)
+            (dolist (pos (list open close))
+              (when (eq (sgn-format--char text (1- pos)) ?\\)
+                (push (cons (1- pos) pos) removals)))
+          (push (cons open (+ open len)) removals)
+          (push (cons close (+ close len)) removals)
+          (push (list (plist-get pair :style) (+ open len) close) spans))))
+    (setq removals (sort removals (lambda (a b) (< (car a) (car b)))))
+    (let ((plain (sgn-format--remove-intervals text removals)))
+      (list :text plain
+            :styles
+            (sort (mapcar
+                   (pcase-lambda (`(,style ,beg ,end))
+                     (let ((b (sgn-format--shift beg removals))
+                           (e (sgn-format--shift end removals)))
+                       (list style (sgn-format-char-to-utf16 plain b)
+                             (- (sgn-format-char-to-utf16 plain e)
+                                (sgn-format-char-to-utf16 plain b)))))
+                   spans)
+                  (lambda (a b) (< (nth 1 a) (nth 1 b))))))))
 
 (defun sgn-format--remove-intervals (text intervals)
-  "Remove INTERVALS (list of (start . end) pairs) from TEXT.
-INTERVALS must be sorted by start position and non-overlapping."
-  (let ((parts nil)
-        (prev-end 0))
-    (dolist (iv intervals)
-      (when (> (car iv) prev-end)
-        (push (substring text prev-end (car iv)) parts))
-      (setq prev-end (cdr iv)))
-    (when (< prev-end (length text))
-      (push (substring text prev-end) parts))
+  "Return TEXT without INTERVALS, sorted (START . END) pairs."
+  (let ((parts nil) (prev 0))
+    (pcase-dolist (`(,start . ,end) intervals)
+      (push (substring text prev start) parts)
+      (setq prev end))
+    (push (substring text prev) parts)
     (apply #'concat (nreverse parts))))
 
-(defun sgn-format--compute-styles (ranges removals)
-  "Compute final style alists from RANGES after delimiter REMOVALS.
-Each removal shifts subsequent positions.  Return a list of alists
-with `start', `length', and `style' keys."
-  (let ((styles nil))
-    (dolist (r ranges)
-      (let* ((content-start-orig (plist-get r :open-end))
-             (content-end-orig (plist-get r :close-start))
-             (adj-start (sgn-format--adjusted-pos content-start-orig removals))
-             (adj-end (sgn-format--adjusted-pos content-end-orig removals))
-             (len (- adj-end adj-start)))
-        (when (> len 0)
-          (push `((start . ,adj-start)
-                  (length . ,len)
-                  (style . ,(plist-get r :style)))
-                styles))))
-    (nreverse styles)))
+(defun sgn-format--shift (pos removals)
+  "Return POS after the characters of REMOVALS before it are removed."
+  (- pos (cl-loop for (start . end) in removals
+                  when (<= end pos) sum (- end start))))
 
-(defun sgn-format--adjusted-pos (pos removals)
-  "Adjust POS by subtracting characters removed before it in REMOVALS.
-REMOVALS is a sorted list of (start . end) pairs."
-  (let ((offset 0))
-    (dolist (iv removals)
-      (cond
-       ((<= (cdr iv) pos)
-        (setq offset (+ offset (- (cdr iv) (car iv)))))
-       ((< (car iv) pos)
-        ;; pos is inside a removal — shouldn't happen for content boundaries,
-        ;; but handle gracefully.
-        (setq offset (+ offset (- pos (car iv)))))))
-    (- pos offset)))
+;;;; Composing markup from styles
 
-(defun sgn-format--unescape-delimiters (text)
-  "Remove backslash escapes from delimiter characters in TEXT.
-E.g., \\* becomes *, \\| becomes |."
-  (let ((result (make-string (length text) 0))
-        (ri 0)
-        (ti 0)
-        (tlen (length text)))
-    (while (< ti tlen)
-      (if (and (eq (aref text ti) ?\\)
-               (< (1+ ti) tlen)
-               (sgn-format--delimiter-char-p (aref text (1+ ti))))
-          (progn
-            (aset result ri (aref text (1+ ti)))
-            (setq ri (1+ ri))
-            (setq ti (+ ti 2)))
-        (aset result ri (aref text ti))
-        (setq ri (1+ ri))
-        (setq ti (1+ ti))))
-    (substring result 0 ri)))
+(defun sgn-format-to-markup (body styles)
+  "Return BODY with STYLES written back as markup, for editing.
+STYLES is a list of (STYLE START LENGTH) in UTF-16 units.
+Delimiter characters that would otherwise be read as markup are
+escaped.  Overlapping styles are written innermost last."
+  (let ((inserts nil))
+    (pcase-dolist (`(,style ,start ,length) styles)
+      (when-let* ((delim (car (rassoc style sgn-format--markup))))
+        (push (cons (sgn-format-utf16-to-char body start) delim) inserts)
+        (push (cons (sgn-format-utf16-to-char body (+ start length)) delim)
+              inserts)))
+    (let ((escaped (sgn-format--escape-literal-markup body))
+          (result nil) (prev 0))
+      (pcase-dolist (`(,pos . ,delim)
+                     (sort inserts (lambda (a b) (< (car a) (car b)))))
+        (push (sgn-format--escaped-substring body escaped prev pos) result)
+        (push delim result)
+        (setq prev pos))
+      (push (sgn-format--escaped-substring body escaped prev (length body)) result)
+      (apply #'concat (nreverse result)))))
 
-(defun sgn-format--unescape-with-offsets (text)
-  "Remove backslash escapes from TEXT and track position adjustments.
-Return (CLEANED-TEXT . OFFSETS) where OFFSETS is a list of
-positions (in the intermediate text) where a backslash was removed."
-  (let ((result (make-string (length text) 0))
-        (ri 0)
-        (ti 0)
-        (tlen (length text))
-        (offsets nil))
-    (while (< ti tlen)
-      (if (and (eq (aref text ti) ?\\)
-               (< (1+ ti) tlen)
-               (sgn-format--delimiter-char-p (aref text (1+ ti))))
-          (progn
-            (push ti offsets)
-            (aset result ri (aref text (1+ ti)))
-            (setq ri (1+ ri))
-            (setq ti (+ ti 2)))
-        (aset result ri (aref text ti))
-        (setq ri (1+ ri))
-        (setq ti (1+ ti))))
-    (cons (substring result 0 ri) (nreverse offsets))))
+(defun sgn-format--escape-literal-markup (body)
+  "Return the positions in BODY of delimiters that would parse as markup."
+  (let ((protected (sgn-format--url-mask body))
+        (positions nil))
+    (dolist (rule sgn-format--markup)
+      (dolist (pair (sgn-format--find-pairs body (car rule) (cdr rule)
+                                            (copy-sequence protected)))
+        (push (plist-get pair :open) positions)
+        (push (plist-get pair :close) positions)))
+    positions))
 
-(defun sgn-format--adjust-styles-for-escapes (styles escape-offsets)
-  "Adjust STYLES start/length values for backslash removals at ESCAPE-OFFSETS.
-Each offset in ESCAPE-OFFSETS is a position in the intermediate text
-where a single backslash character was removed."
-  (if (null escape-offsets)
-      styles
-    (mapcar
-     (lambda (style)
-       (let* ((start (alist-get 'start style))
-              (len (alist-get 'length style))
-              (end (+ start len))
-              (start-adj (sgn-format--count-before start escape-offsets))
-              (end-adj (sgn-format--count-before end escape-offsets))
-              (new-start (- start start-adj))
-              (new-end (- end end-adj)))
-         `((start . ,new-start)
-           (length . ,(- new-end new-start))
-           (style . ,(alist-get 'style style)))))
-     styles)))
+(defun sgn-format--escaped-substring (body escaped start end)
+  "Return BODY from START to END, with a backslash before ESCAPED positions."
+  (let ((parts nil))
+    (cl-loop for i from start below end
+             do (when (memq i escaped) (push "\\" parts))
+             (push (string (aref body i)) parts))
+    (apply #'concat (nreverse parts))))
 
-(defun sgn-format--count-before (pos offsets)
-  "Count how many values in OFFSETS are strictly less than POS.
-OFFSETS must be sorted in ascending order."
-  (let ((count 0))
-    (dolist (o offsets)
-      (if (< o pos)
-          (setq count (1+ count))
-        (cl-return count)))
-    count))
+;;;; Previews
 
-(defun sgn-format--delimiter-char-p (char)
-  "Return non-nil if CHAR is a character used in markup delimiters."
-  (memq char '(?* ?_ ?~ ?` ?|)))
-
-;;;; JSON serialization
-
-(defun sgn-format-styles-to-json (styles)
-  "Convert STYLES (list of alists with start/length/style) to a JSON string.
-Return a JSON array string, or nil if STYLES is empty."
-  (if (null styles)
-      nil
-    (json-encode (apply #'vector styles))))
+(defun sgn-format-preview (msg)
+  "Return MSG's text on one line, with mentions and spoilers concealed.
+Return nil if MSG has no text."
+  (when-let* ((body (plist-get msg :body)))
+    (unless (string-empty-p body)
+      (let ((text (sgn-format-render
+                   body
+                   (sgn-format-read-ranges (plist-get msg :styles-json))
+                   (sgn-format-read-ranges (plist-get msg :mentions-json)))))
+        (dotimes (i (length text))
+          (when (get-text-property i 'sgn-spoiler text)
+            (aset text i ?▒)))
+        (replace-regexp-in-string "\n" " " (substring-no-properties text))))))
 
 (provide 'sgn-format)
 ;;; sgn-format.el ends here

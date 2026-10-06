@@ -9,21 +9,22 @@
 
 ;;; Commentary:
 
-;; Notification system: modeline/tab-bar unread indicator and desktop
-;; notifications (OS-native).
+;; The unread indicator in the mode line or tab bar, and desktop
+;; notifications for incoming messages.  Notifications for a chat are
+;; collected for a moment and shown together, so that a backlog
+;; delivered after a reconnect produces one notification per chat.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
+(require 'sgn-db)
+(require 'sgn-format)
+(require 'sgn-contacts)
 
-(declare-function sgn--log "sgn")
-(declare-function sgn-db-get-chats "sgn-db")
-(declare-function sgn-db-get-chat "sgn-db")
 (declare-function sgn-chat-open "sgn-chat")
-(declare-function sgn-contacts-get-name "sgn-contacts")
+(declare-function notifications-notify "notifications")
 (declare-function sgn-rpc-failure-advice "sgn-rpc")
-
-(defvar sgn-account)
 
 ;;;; Customization
 
@@ -51,25 +52,15 @@
   "Face for the indicator shown when signal-cli has failed."
   :group 'sgn)
 
-;;;; Internal state
+;;;; Indicator
 
 (defvar sgn-notify--global-unread 0
-  "Total unread message count across all chats.")
+  "Total unread message count across chats that are not muted.")
 
 (defvar sgn-notify--modeline-string ""
-  "Current modeline indicator string.")
-
-(defvar sgn-notify--tab-bar-item nil
-  "Tab bar item for the unread indicator.")
-
-;;;; Modeline indicator
-
-(defun sgn-notify--update-modeline ()
-  "Update the modeline indicator string."
-  (setq sgn-notify--modeline-string
-        (if-let* ((label (sgn-notify--indicator-label)))
-            (concat " [" label "]")
-          "")))
+  "Current mode line indicator string.")
+;; The mode line only shows text properties of risky variables.
+(put 'sgn-notify--modeline-string 'risky-local-variable t)
 
 (defun sgn-notify--indicator-label ()
   "Return the propertized indicator text, or nil when there is nothing to show.
@@ -81,141 +72,149 @@ no new messages arrive until it is fixed."
                 'help-echo (sgn-rpc-failure-advice)))
    ((> sgn-notify--global-unread 0)
     (propertize (format "sgn:%d" sgn-notify--global-unread)
-                'face 'sgn-unread-face))))
+                'face 'sgn-unread-face
+                'help-echo "Unread Signal messages"))))
 
-(defun sgn-notify--install-modeline ()
-  "Add the sgn indicator to `global-mode-string'."
-  (unless (memq 'sgn-notify--modeline-string global-mode-string)
-    (setq global-mode-string
-          (append global-mode-string '(sgn-notify--modeline-string)))))
+(defun sgn-notify-update ()
+  "Recount unread messages and update the indicator."
+  (setq sgn-notify--global-unread
+        (if (bound-and-true-p sgn-db--connection) (sgn-db-total-unread) 0))
+  (setq sgn-notify--modeline-string
+        (if-let* ((label (sgn-notify--indicator-label)))
+            (concat " [" label "]")
+          ""))
+  (force-mode-line-update t))
 
-(defun sgn-notify--remove-modeline ()
-  "Remove the sgn indicator from `global-mode-string'."
-  (setq global-mode-string
-        (delq 'sgn-notify--modeline-string global-mode-string)))
-
-;;;; Tab-bar indicator
-
-(defun sgn-notify--tab-bar-item ()
-  "Return a tab-bar item showing the sgn indicator."
-  (when-let* ((label (sgn-notify--indicator-label)))
-    (concat " " label " ")))
-
-(defun sgn-notify--install-tab-bar ()
-  "Add the sgn indicator to the tab bar."
-  (when (and (boundp 'tab-bar-format) (fboundp 'tab-bar-mode))
-    (unless (memq 'sgn-notify--tab-bar-format tab-bar-format)
-      (setq tab-bar-format
-            (append tab-bar-format '(sgn-notify--tab-bar-format))))))
-
-(defun sgn-notify--remove-tab-bar ()
-  "Remove the sgn indicator from the tab bar."
-  (when (boundp 'tab-bar-format)
-    (setq tab-bar-format
-          (delq 'sgn-notify--tab-bar-format tab-bar-format))))
+(defun sgn-notify-on-store-changed (_chat-ids)
+  "Update the indicator, as `sgn-store-changed-functions' asks."
+  (sgn-notify-update))
 
 (defun sgn-notify--tab-bar-format ()
   "Tab bar format function for the sgn indicator."
-  (when-let* ((item (sgn-notify--tab-bar-item)))
-    `((sgn-unread menu-item ,item ignore
+  (when-let* ((label (sgn-notify--indicator-label)))
+    `((sgn-unread menu-item ,(concat " " label " ") ignore
                   :help ,(or (sgn-rpc-failure-advice)
                              "Unread Signal messages")))))
 
-;;;; Update unread counts
+(defun sgn-notify--install ()
+  "Add the indicator where `sgn-notification-style' says."
+  (pcase sgn-notification-style
+    ('modeline
+     (unless (memq 'sgn-notify--modeline-string global-mode-string)
+       (setq global-mode-string
+             (append global-mode-string '(sgn-notify--modeline-string)))))
+    ('tab-bar
+     (when (boundp 'tab-bar-format)
+       (unless (memq 'sgn-notify--tab-bar-format tab-bar-format)
+         (setq tab-bar-format
+               (append tab-bar-format '(sgn-notify--tab-bar-format))))))))
 
-(defun sgn-notify-update ()
-  "Recalculate global unread count and update indicators."
-  (let ((chats (sgn-db-get-chats))
-        (total 0))
-    (dolist (chat chats)
-      (let ((unread (plist-get chat :unread))
-            (muted (plist-get chat :muted)))
-        (when (and unread (> unread 0)
-                   (or (null muted) (zerop muted)))
-          (setq total (+ total unread)))))
-    (setq sgn-notify--global-unread total)
-    (sgn-notify--update-modeline)
-    (force-mode-line-update t)))
+(defun sgn-notify--uninstall ()
+  "Remove the indicator."
+  (setq global-mode-string
+        (delq 'sgn-notify--modeline-string global-mode-string))
+  (when (boundp 'tab-bar-format)
+    (setq tab-bar-format (delq 'sgn-notify--tab-bar-format tab-bar-format))))
 
 ;;;; Desktop notifications
 
-(defun sgn-notify-message (chat-id sender body)
-  "Show a desktop notification for a new message.
-CHAT-ID is the chat, SENDER is the sender name/ID, BODY is the message text.
-Suppressed for muted chats."
-  (when sgn-desktop-notifications
-    (let ((chat (sgn-db-get-chat chat-id)))
-      (unless (and chat (not (zerop (or (plist-get chat :muted) 0))))
-        (let* ((title (format "sgn: %s" (sgn-contacts-get-name
-                                          (or sender chat-id))))
-               (preview (cond
-                         (body (if (> (length body) 100)
-                                   (concat (substring body 0 100) "…")
-                                 body))
-                         (t "New message"))))
-          (sgn-notify--desktop-notify title preview chat-id))))))
+(defvar sgn-notify--queued nil
+  "Alist of (CHAT-ID . ROWIDS) of messages waiting to be announced.")
+
+(defvar sgn-notify--timer nil
+  "Timer that shows the queued notifications.")
+
+(defconst sgn-notify--delay 1
+  "Seconds to collect a chat's messages before announcing them.")
+
+(defun sgn-notify-message (chat-id rowid)
+  "Announce message ROWID in CHAT-ID, unless the chat is muted."
+  (when (and sgn-desktop-notifications
+             (eql 0 (plist-get (sgn-db-get-chat chat-id) :muted)))
+    (push rowid (alist-get chat-id sgn-notify--queued nil nil #'equal))
+    (unless (timerp sgn-notify--timer)
+      (setq sgn-notify--timer
+            (run-at-time sgn-notify--delay nil #'sgn-notify--flush)))))
+
+(defun sgn-notify--flush ()
+  "Show one notification for each chat with queued messages."
+  (let ((queued (nreverse sgn-notify--queued)))
+    (setq sgn-notify--queued nil
+          sgn-notify--timer nil)
+    (when (bound-and-true-p sgn-db--connection)
+      (pcase-dolist (`(,chat-id . ,rowids) queued)
+        (let ((messages (cl-remove-if
+                         (lambda (msg) (or (null msg) (plist-get msg :read-at)))
+                         (mapcar #'sgn-db-get-message-by-rowid
+                                 (reverse rowids)))))
+          (when messages
+            (sgn-notify--show chat-id messages)))))))
+
+(defun sgn-notify--show (chat-id messages)
+  "Show a notification for MESSAGES, new in CHAT-ID."
+  (let* ((last (car (last messages)))
+         (sender (sgn-contacts-get-name (plist-get last :sender)))
+         (group (equal (sgn-db-chat-type chat-id) "group"))
+         (title (if group
+                    (format "%s in %s" sender (sgn-contacts-get-name chat-id))
+                  sender))
+         (body (if (cdr messages)
+                   (format "%d new messages" (length messages))
+                 (sgn-notify--preview last))))
+    (sgn-notify--desktop-notify title body chat-id)))
+
+(defun sgn-notify--preview (msg)
+  "Return a short preview of MSG, with spoilers concealed."
+  (if-let* ((text (sgn-format-preview msg)))
+      (truncate-string-to-width text 100 nil nil "…")
+    "[Attachment]"))
 
 (defun sgn-notify--desktop-notify (title body chat-id)
-  "Send a desktop notification with TITLE and BODY.
-CHAT-ID is used for click-to-open."
+  "Show a desktop notification with TITLE and BODY for CHAT-ID."
   (cond
-   ;; macOS
    ((eq system-type 'darwin)
-    (sgn-notify--macos-notify title body chat-id))
-   ;; Linux (D-Bus notifications)
-   ((and (eq system-type 'gnu/linux)
-         (fboundp 'notifications-notify))
-    (require 'notifications)
+    (sgn-notify--macos-notify title body))
+   ((and (eq system-type 'gnu/linux) (require 'notifications nil t))
     (notifications-notify
      :title title
-     :body body
+     :body (sgn-notify--escape-markup body)
      :app-name "sgn"
-     :actions '("open" "Open Chat")
-     :on-action (lambda (_id _key)
-                  (sgn-chat-open chat-id))))
-   ;; Fallback: message
+     :actions '("default" "Open chat")
+     :on-action (lambda (_id _key) (sgn-chat-open chat-id))))
    (t
     (message "%s: %s" title body))))
 
-(defun sgn-notify--macos-notify (title body chat-id)
-  "Send macOS notification via osascript.
-TITLE and BODY are the notification content.  CHAT-ID is unused
-here (AppleScript notifications don't support click callbacks
-reliably)."
-  (ignore chat-id)
-  (let ((script (format
-                 "display notification %s with title %s"
-                 (sgn-notify--applescript-quote body)
-                 (sgn-notify--applescript-quote title))))
-    (start-process "sgn-notify" nil "osascript" "-e" script)))
+(defun sgn-notify--escape-markup (text)
+  "Escape TEXT for notification daemons that interpret markup."
+  (replace-regexp-in-string
+   "[&<>]" (lambda (c) (pcase c ("&" "&amp;") ("<" "&lt;") (">" "&gt;")))
+   text t t))
+
+(defun sgn-notify--macos-notify (title body)
+  "Show a macOS notification with TITLE and BODY via osascript."
+  (start-process "sgn-notify" nil "osascript" "-e"
+                 (format "display notification %s with title %s"
+                         (sgn-notify--applescript-quote body)
+                         (sgn-notify--applescript-quote title))))
 
 (defun sgn-notify--applescript-quote (str)
-  "Quote STR for use in AppleScript."
+  "Return STR as an AppleScript string literal."
   (format "\"%s\"" (replace-regexp-in-string "[\"\\\\]" "\\\\\\&" str)))
 
 ;;;; Global minor mode
 
-(defvar sgn-global-mode-map (make-sparse-keymap)
-  "Keymap for `sgn-global-mode'.")
-
 ;;;###autoload
 (define-minor-mode sgn-global-mode
-  "Global minor mode that shows Signal unread count indicator."
+  "Global minor mode that shows the Signal unread count indicator."
   :global t
   :lighter nil
   :group 'sgn
-  :keymap sgn-global-mode-map
-  (require 'sgn)
   (if sgn-global-mode
-      (progn
-        (pcase sgn-notification-style
-          ('modeline (sgn-notify--install-modeline))
-          ('tab-bar (sgn-notify--install-tab-bar)))
-        (sgn-notify-update))
-    (sgn-notify--remove-modeline)
-    (sgn-notify--remove-tab-bar)
-    (setq sgn-notify--global-unread 0)
-    (sgn-notify--update-modeline)
+      (progn (sgn-notify--install)
+             (sgn-notify-update))
+    (sgn-notify--uninstall)
+    (setq sgn-notify--global-unread 0
+          sgn-notify--modeline-string "")
     (force-mode-line-update t)))
 
 (provide 'sgn-notify)

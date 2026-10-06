@@ -9,311 +9,308 @@
 
 ;;; Commentary:
 
-;; One-time import of message history from Signal Desktop's SQLCipher
-;; database into sgn's SQLite database.  Requires `sqlcipher' CLI.
+;; Import of text message history from Signal Desktop's SQLCipher
+;; database into sgn's database.  Requires the `sqlcipher' program,
+;; and on macOS `node' to decrypt the database key Signal Desktop
+;; keeps in the Keychain.
+;;
+;; Secrets never appear on a command line, where other processes
+;; could read them: the key and the SQL that uses it are passed to
+;; the helper programs on their standard input.
+;;
+;; Messages already stored are skipped, so importing again is safe.
+;; Messages whose disappearing timer ran out are not imported, and
+;; the others keep counting down.  Reactions come from each message's
+;; own record, which holds its current reactions.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'json)
+(require 'sgn-db)
+(require 'sgn-format)
 
 (declare-function sgn--log "sgn")
-(declare-function sgn-db-upsert-chat "sgn-db")
-(declare-function sgn-db-insert-message "sgn-db")
-(declare-function sgn-db-upsert-reaction "sgn-db")
-(declare-function sgn-db-get-message "sgn-db")
+(declare-function sgn-ensure-running "sgn")
+(declare-function sgn-store-self "sgn-store")
+(declare-function sgn-store-changed "sgn-store")
+(declare-function sgn-contacts-set-name "sgn-contacts")
+(declare-function sgn-contacts-name-known-p "sgn-contacts")
 
 (defvar sgn-account)
-(defvar sgn-db--connection)
 
 ;;;; Configuration
 
-(defconst sgn-import--desktop-db-path
-  (expand-file-name "Library/Application Support/Signal/sql/db.sqlite"
-                    (getenv "HOME"))
-  "Path to Signal Desktop's SQLCipher database.")
+(defconst sgn-import--desktop-directory
+  (expand-file-name "Library/Application Support/Signal" (getenv "HOME"))
+  "Directory of Signal Desktop's data.")
 
-(defconst sgn-import--desktop-config-path
-  (expand-file-name "Library/Application Support/Signal/config.json"
-                    (getenv "HOME"))
-  "Path to Signal Desktop's config file (contains the DB key).")
+(defun sgn-import--desktop-db-path ()
+  "Return the path of Signal Desktop's SQLCipher database."
+  (expand-file-name "sql/db.sqlite" sgn-import--desktop-directory))
+
+(defun sgn-import--desktop-config-path ()
+  "Return the path of Signal Desktop's config file, which holds the key."
+  (expand-file-name "config.json" sgn-import--desktop-directory))
+
+;;;; Running helpers
+
+(defun sgn-import--run (input program &rest args)
+  "Run PROGRAM with ARGS, feeding it INPUT; return its standard output.
+Signal an error, quoting its standard error, if it fails."
+  (let ((stderr (make-temp-file "sgn-import-err-")))
+    (unwind-protect
+        (with-temp-buffer
+          (insert input)
+          (let ((status (apply #'call-process-region (point-min) (point-max)
+                               program t (list t stderr) nil args)))
+            (unless (eql status 0)
+              (error "%s failed (%s): %s" program status
+                     (with-temp-buffer
+                       (insert-file-contents stderr)
+                       (string-trim (buffer-string)))))
+            (buffer-string)))
+      (delete-file stderr))))
 
 ;;;; Key extraction
 
 (defun sgn-import--read-key ()
-  "Read the SQLCipher key from Signal Desktop's config.json.
-Handles both the legacy plain `key' field and the newer
-`encryptedKey' field (Chromium safeStorage, decrypted via
-macOS Keychain + PBKDF2 + AES-128-CBC)."
-  (unless (file-exists-p sgn-import--desktop-config-path)
-    (user-error "Signal Desktop config not found: %s"
-                sgn-import--desktop-config-path))
-  (let* ((json-object-type 'alist)
-         (config (json-read-file sgn-import--desktop-config-path))
-         (plain-key (alist-get 'key config))
-         (encrypted-key (alist-get 'encryptedKey config)))
-    (cond
-     (plain-key plain-key)
-     (encrypted-key (sgn-import--decrypt-safe-storage-key encrypted-key))
-     (t (user-error "No key or encryptedKey found in Signal Desktop config")))))
+  "Return Signal Desktop's database key, as 64 hex digits."
+  (let* ((path (sgn-import--desktop-config-path))
+         (config (if (file-readable-p path)
+                     (json-parse-string (with-temp-buffer
+                                          (insert-file-contents path)
+                                          (buffer-string))
+                                        :object-type 'alist)
+                   (user-error "Signal Desktop config not found: %s" path)))
+         (key (or (alist-get 'key config)
+                  (when-let* ((encrypted (alist-get 'encryptedKey config)))
+                    (sgn-import--decrypt-key encrypted))
+                  (user-error "No key found in Signal Desktop's config"))))
+    (unless (string-match-p "\\`[0-9a-fA-F]\\{64\\}\\'" key)
+      (user-error "Signal Desktop's database key has an unexpected form"))
+    key))
 
-(defun sgn-import--decrypt-safe-storage-key (encrypted-hex)
-  "Decrypt Chromium safeStorage ENCRYPTED-HEX using macOS Keychain.
-Returns the hex DB key string."
-  (let* ((keychain-pass (string-trim
-                         (shell-command-to-string
-                          "security find-generic-password -s 'Signal Safe Storage' -w 2>/dev/null || security find-generic-password -s 'Signal' -w")))
-         (script (format
-                  "const crypto = require('crypto');\
-const enc = Buffer.from('%s', 'hex');\
-const key = crypto.pbkdf2Sync('%s', 'saltysalt', 1003, 16, 'sha1');\
-const iv = Buffer.alloc(16, 32);\
-const d = crypto.createDecipheriv('aes-128-cbc', key, iv);\
-process.stdout.write(Buffer.concat([d.update(enc.subarray(3)), d.final()]).toString('utf8'));"
-                  encrypted-hex keychain-pass))
-         (result (with-temp-buffer
-                   (call-process "node" nil t nil "-e" script)
-                   (buffer-string))))
-    (when (string-empty-p result)
-      (user-error "Failed to decrypt Signal Desktop encryptedKey"))
-    result))
+(defconst sgn-import--decrypt-script
+  "const crypto = require('crypto');
+let input = '';
+process.stdin.on('data', d => input += d);
+process.stdin.on('end', () => {
+  const {encrypted, password} = JSON.parse(input);
+  const enc = Buffer.from(encrypted, 'hex');
+  const key = crypto.pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
+  const d = crypto.createDecipheriv('aes-128-cbc', key, Buffer.alloc(16, 32));
+  process.stdout.write(Buffer.concat([d.update(enc.subarray(3)),
+                                      d.final()]).toString('utf8'));
+});"
+  "Node script decrypting Chromium safeStorage data read from stdin.")
+
+(defun sgn-import--decrypt-key (encrypted)
+  "Decrypt the safeStorage-encrypted key ENCRYPTED with the Keychain password."
+  (unless (eq system-type 'darwin)
+    (user-error "Decrypting Signal Desktop's key is only supported on macOS"))
+  (unless (string-match-p "\\`[0-9a-fA-F]+\\'" encrypted)
+    (user-error "Signal Desktop's encrypted key has an unexpected form"))
+  (let ((password (string-trim
+                   (sgn-import--run "" "security" "find-generic-password"
+                                    "-s" "Signal Safe Storage" "-w"))))
+    (string-trim (sgn-import--run (json-encode `((encrypted . ,encrypted)
+                                                 (password . ,password)))
+                                  "node" "-e" sgn-import--decrypt-script))))
 
 ;;;; Export via sqlcipher
 
-(defun sgn-import--export-to-plain-db ()
-  "Export Signal Desktop's encrypted DB to a temporary plain SQLite file.
-Return the path to the temporary file."
+(defun sgn-import--sql-string (string)
+  "Return STRING as an SQL string literal."
+  (concat "'" (string-replace "'" "''" string) "'"))
+
+(defun sgn-import--export ()
+  "Export the data to import from Signal Desktop's database.
+Return the path of a temporary plain SQLite database."
   (unless (executable-find "sqlcipher")
-    (user-error "sqlcipher not found; install with: brew install sqlcipher"))
-  (unless (file-exists-p sgn-import--desktop-db-path)
+    (user-error "The sqlcipher program is needed to import from Signal Desktop"))
+  (unless (file-exists-p (sgn-import--desktop-db-path))
     (user-error "Signal Desktop database not found: %s"
-                sgn-import--desktop-db-path))
-  (let* ((key (sgn-import--read-key))
-         (tmp-db (make-temp-file "sgn-import-" nil ".db"))
-         (sql (format "PRAGMA key = \"x'%s'\";
-ATTACH DATABASE '%s' AS export KEY '';
+                (sgn-import--desktop-db-path)))
+  (let ((key (sgn-import--read-key))
+        (export (make-temp-file "sgn-import-" nil ".db")))
+    (delete-file export)
+    (condition-case err
+        (sgn-import--run
+         (format "PRAGMA key = \"x'%s'\";
+ATTACH DATABASE %s AS export KEY '';
 CREATE TABLE export.conversations AS
-  SELECT id, type, name, profileFullName, e164, serviceId, groupId, active_at
+  SELECT id, type, name, profileFullName, e164, serviceId, groupId
   FROM conversations;
 CREATE TABLE export.messages AS
-  SELECT rowid, sent_at, type, sourceServiceId, body, conversationId,
-         received_at, expireTimer, expirationStartTimestamp, isErased,
-         json
+  SELECT sent_at, type, sourceServiceId, body, conversationId, expireTimer,
+         expirationStartTimestamp, json
   FROM messages
-  WHERE body IS NOT NULL AND body != '' AND isErased IS NOT 1;
-CREATE TABLE export.reactions AS
-  SELECT conversationId, emoji, fromId, targetAuthorAci,
-         targetTimestamp, timestamp
-  FROM reactions;
-DETACH DATABASE export;" key tmp-db))
-         (exit-code (call-process "sqlcipher" nil nil nil
-                                  sgn-import--desktop-db-path
-                                  sql)))
-    (unless (zerop exit-code)
-      (when (file-exists-p tmp-db) (delete-file tmp-db))
-      (user-error "sqlcipher export failed (exit code %d)" exit-code))
-    (sgn--log "sgn-import: exported to %s" tmp-db)
-    tmp-db))
+  WHERE type IN ('incoming', 'outgoing')
+    AND body IS NOT NULL AND body != ''
+    AND isErased IS NOT 1
+    AND storyId IS NULL
+    AND NOT (COALESCE(expireTimer, 0) > 0
+             AND expirationStartTimestamp IS NOT NULL
+             AND expirationStartTimestamp + expireTimer * 1000
+                 <= CAST(strftime('%%s', 'now') AS INTEGER) * 1000);
+DETACH DATABASE export;
+" key (sgn-import--sql-string export))
+         "sqlcipher" (sgn-import--desktop-db-path))
+      (error
+       (when (file-exists-p export) (delete-file export))
+       (signal (car err) (cdr err))))
+    export))
 
-;;;; ID mapping
+;;;; Import
 
-(defun sgn-import--build-mappings (export-db)
-  "Build ID mappings from EXPORT-DB.
-Return a plist with:
-  :conv-to-chat — hash: Desktop conversation UUID → sgn chat ID
-  :uuid-to-id   — hash: any UUID (serviceId or conv-id) → sgn sender ID"
-  (let ((conv-to-chat (make-hash-table :test 'equal))
-        (uuid-to-id (make-hash-table :test 'equal))
-        (rows (sqlite-select export-db
-                "SELECT id, type, name, profileFullName, e164, serviceId, groupId, active_at
-                 FROM conversations")))
-    (dolist (row rows)
-      (let* ((conv-id (nth 0 row))
-             (type (nth 1 row))
-             (name (nth 2 row))
-             (profile-name (nth 3 row))
-             (e164 (nth 4 row))
-             (service-id (nth 5 row))
-             (group-id (nth 6 row))
-             (active-at (nth 7 row))
-             ;; Determine sgn chat ID
-             (chat-id (cond
-                       ;; Group: use groupId (base64)
-                       ((and (equal type "group") group-id)
-                        group-id)
-                       ;; Private: prefer e164, fall back to serviceId
-                       (e164 e164)
-                       (service-id service-id)))
-             ;; Sender ID for messages/reactions: prefer e164
-             (sender-id (or e164 service-id))
-             ;; Display name
-             (display-name (or (and name (not (string-empty-p name)) name)
-                               (and profile-name
-                                    (not (string-empty-p profile-name))
-                                    profile-name))))
-        (when chat-id
-          (puthash conv-id chat-id conv-to-chat)
-          ;; Map both serviceId AND conv-id → sender ID
-          ;; so reactions (which use conv-id as fromId) resolve too
-          (when sender-id
-            (when service-id
-              (puthash service-id sender-id uuid-to-id))
-            (puthash conv-id sender-id uuid-to-id))
-          ;; Upsert chat into sgn DB
-          (sgn-db-upsert-chat chat-id
-                              :name (or display-name "")
-                              :type (if (equal type "group") "group" "individual")
-                              :last-msg-ts active-at)
-          ;; Register name in contacts cache for rendering
-          (when (and display-name sender-id)
-            (sgn-contacts-set-name sender-id display-name)))))
-    (list :conv-to-chat conv-to-chat
-          :uuid-to-id uuid-to-id)))
+(defun sgn-import--conversations (export-db)
+  "Return a hash table mapping Desktop conversation IDs to plists.
+Each plist has the :chat-id and :type sgn uses for the
+conversation, and :person, the identifier of its member for
+direct chats.  Read from EXPORT-DB."
+  (let ((table (make-hash-table :test 'equal)))
+    (pcase-dolist (`(,id ,type ,name ,profile-name ,e164 ,service-id ,group-id)
+                   (sqlite-select export-db
+                                  "SELECT id, type, name, profileFullName, e164,
+                                          serviceId, groupId
+                                   FROM conversations"))
+      (let ((person (or service-id e164))
+            (name (seq-find (lambda (s) (and s (not (string-empty-p s))))
+                            (list name profile-name))))
+        (cond
+         ((and (equal type "group") group-id)
+          (puthash id (list :chat-id group-id :type "group" :name name) table))
+         (person
+          (puthash id (list :chat-id person :type "individual" :name name
+                            :person person :number e164)
+                   table)))))
+    table))
 
-;;;; Message import
+(defun sgn-import--message-json (json)
+  "Return the message record JSON as an alist, or nil if it is malformed."
+  (when json
+    (ignore-errors
+      (json-parse-string json :object-type 'alist :array-type 'list
+                         :null-object nil :false-object nil))))
 
-(defun sgn-import--resolve-sender (msg-type source-uuid uuid-to-id)
-  "Resolve the sender ID for a message.
-MSG-TYPE is \"incoming\" or \"outgoing\".  SOURCE-UUID is the
-sender's serviceId.  UUID-TO-ID maps UUIDs to phone numbers."
-  (cond
-   ((equal msg-type "outgoing") sgn-account)
-   ((and source-uuid (gethash source-uuid uuid-to-id)))
-   (source-uuid source-uuid)
-   (t "unknown")))
+(defun sgn-import--import (export-db)
+  "Import the conversations and messages in EXPORT-DB.
+Return (MESSAGES . REACTIONS), the numbers imported."
+  (let ((conversations (sgn-import--conversations export-db))
+        (self (sgn-store-self))
+        (chats nil)
+        (messages 0)
+        (reactions 0))
+    (sgn-db-with-transaction
+      (pcase-dolist (`(,sent-at ,type ,source ,body ,conversation-id
+                       ,expire-timer ,expire-start ,json)
+                     (sqlite-select export-db
+                                    "SELECT sent_at, type, sourceServiceId, body,
+                                            conversationId, expireTimer,
+                                            expirationStartTimestamp, json
+                                     FROM messages ORDER BY sent_at"))
+        (when-let* ((chat (gethash conversation-id conversations))
+                    (sender (if (equal type "outgoing") self
+                              (or source (plist-get chat :person)))))
+          (let* ((chat-id (plist-get chat :chat-id))
+                 (record (sgn-import--message-json json))
+                 (expires-in (or expire-timer 0))
+                 (rowid (progn
+                          (sgn-import--ensure-chat chat)
+                          (sgn-db-insert-message
+                           (append
+                            (list :chat-id chat-id :sender sender
+                                  :timestamp sent-at
+                                  :outgoing (if (equal type "outgoing") 1 0)
+                                  :body body :read-at sent-at
+                                  :expires-in expires-in)
+                            (sgn-import--quote record)
+                            (sgn-import--mentions record)
+                            (when (and (> expires-in 0) expire-start)
+                              (list :expire-started-at expire-start
+                                    :expires-at (+ expire-start
+                                                   (* 1000 expires-in)))))))))
+            (when rowid
+              (cl-incf messages)
+              (sgn-db-touch-chat chat-id sent-at)
+              (push chat-id chats))
+            (cl-incf reactions (sgn-import--reactions
+                                record chat-id sender sent-at conversations))))))
+    (apply #'sgn-store-changed (delete-dups chats))
+    (cons messages reactions)))
 
-(defun sgn-import--import-messages (export-db mappings)
-  "Import messages from EXPORT-DB using MAPPINGS.
-Return the number of messages imported."
-  (let* ((conv-to-chat (plist-get mappings :conv-to-chat))
-         (uuid-to-id (plist-get mappings :uuid-to-id))
-         (rows (sqlite-select export-db
-                 "SELECT sent_at, type, sourceServiceId, body, conversationId,
-                         expireTimer, json
-                  FROM messages
-                  ORDER BY sent_at ASC"))
-         (count 0))
-    (dolist (row rows)
-      (let* ((sent-at (nth 0 row))
-             (msg-type (nth 1 row))
-             (source-uuid (nth 2 row))
-             (body (nth 3 row))
-             (conv-id (nth 4 row))
-             (expire-timer (or (nth 5 row) 0))
-             (raw-json (nth 6 row))
-             (chat-id (gethash conv-id conv-to-chat))
-             (sender (sgn-import--resolve-sender msg-type source-uuid uuid-to-id))
-             ;; Extract quote info from JSON if present
-             (quote-info (sgn-import--extract-quote raw-json uuid-to-id))
-             (sgn-type (if (equal msg-type "outgoing") "sync" "data")))
-        (when (and chat-id body sender)
-          (sgn-db-insert-message
-           (list :chat-id chat-id
-                 :sender sender
-                 :timestamp sent-at
-                 :body body
-                 :type sgn-type
-                 :quote-ts (plist-get quote-info :quote-ts)
-                 :quote-author (plist-get quote-info :quote-author)
-                 :quote-body (plist-get quote-info :quote-body)
-                 :expires-in expire-timer
-                 :raw-json raw-json))
+(defun sgn-import--ensure-chat (chat)
+  "Create the sgn chat for CHAT, a conversation plist, if needed."
+  (let ((id (plist-get chat :chat-id))
+        (name (plist-get chat :name)))
+    (sgn-db-ensure-chat id (plist-get chat :type))
+    (when (and name (not (sgn-contacts-name-known-p id)))
+      (if (equal (plist-get chat :type) "group")
+          (sgn-db-update-chat id :name name)
+        (sgn-db-upsert-recipient id (plist-get chat :number) name))
+      (sgn-contacts-set-name id name))))
+
+(defun sgn-import--quote (record)
+  "Return the quote columns for the Desktop message RECORD."
+  (when-let* ((quote-data (alist-get 'quote record))
+              (id (alist-get 'id quote-data)))
+    (list :quote-ts id
+          :quote-author (or (alist-get 'authorAci quote-data)
+                            (alist-get 'author quote-data))
+          :quote-body (alist-get 'text quote-data))))
+
+(defun sgn-import--mentions (record)
+  "Return the mention column for the Desktop message RECORD.
+Desktop keeps mentions in `bodyRanges', in UTF-16 units like sgn."
+  (when-let* ((mentions
+               (cl-loop for range in (alist-get 'bodyRanges record)
+                        for person = (alist-get 'mentionAci range)
+                        when person
+                        collect (list person (alist-get 'start range)
+                                      (alist-get 'length range)))))
+    (list :mentions-json (sgn-format-ranges-to-json mentions))))
+
+(defun sgn-import--reactions (record chat-id author sent-at conversations)
+  "Import the reactions in the Desktop message RECORD; return their number.
+The message is the one AUTHOR sent at SENT-AT in CHAT-ID.
+CONVERSATIONS maps reactors' conversation IDs to their plists."
+  (let ((count 0))
+    (dolist (reaction (alist-get 'reactions record))
+      (when-let* ((from (gethash (alist-get 'fromId reaction) conversations))
+                  (sender (plist-get from :person))
+                  (emoji (alist-get 'emoji reaction)))
+        (when (sgn-db-set-reaction chat-id author sent-at sender emoji
+                                   (or (alist-get 'timestamp reaction) 0))
           (cl-incf count))))
     count))
 
-(defun sgn-import--extract-quote (raw-json uuid-to-id)
-  "Extract quote/reply info from RAW-JSON.
-Return plist with :quote-ts :quote-author :quote-body, or nil."
-  (when raw-json
-    (condition-case nil
-        (let* ((json-object-type 'alist)
-               (json-array-type 'list)
-               (data (json-read-from-string raw-json))
-               (quote-data (alist-get 'quote data)))
-          (when quote-data
-            (let* ((quote-id (alist-get 'id quote-data))
-                   (quote-author-uuid (alist-get 'authorAci quote-data))
-                   (quote-author (or (and quote-author-uuid
-                                          (gethash quote-author-uuid uuid-to-id))
-                                     quote-author-uuid))
-                   (quote-text (alist-get 'text quote-data)))
-              (when quote-id
-                (list :quote-ts quote-id
-                      :quote-author quote-author
-                      :quote-body quote-text)))))
-      (error nil))))
-
-;;;; Reaction import
-
-(defun sgn-import--import-reactions (export-db mappings)
-  "Import reactions from EXPORT-DB using MAPPINGS.
-Return the number of reactions imported."
-  (let* ((conv-to-chat (plist-get mappings :conv-to-chat))
-         (uuid-to-id (plist-get mappings :uuid-to-id))
-         (rows (sqlite-select export-db
-                 "SELECT conversationId, emoji, fromId, targetAuthorAci,
-                         targetTimestamp
-                  FROM reactions"))
-         (count 0))
-    (dolist (row rows)
-      (let* ((conv-id (nth 0 row))
-             (emoji (nth 1 row))
-             (from-uuid (nth 2 row))
-             (target-author-uuid (nth 3 row))
-             (target-ts (nth 4 row))
-             (chat-id (gethash conv-id conv-to-chat))
-             (sender (or (gethash from-uuid uuid-to-id) from-uuid))
-             (target-author (or (gethash target-author-uuid uuid-to-id)
-                                target-author-uuid)))
-        (when (and chat-id emoji sender target-author target-ts)
-          ;; Find the message rowid
-          (let ((msg (sgn-db-get-message chat-id target-author target-ts)))
-            (when msg
-              (sgn-db-upsert-reaction
-               (list :message-rowid (plist-get msg :rowid)
-                     :chat-id chat-id
-                     :target-author target-author
-                     :target-timestamp target-ts
-                     :sender sender
-                     :emoji emoji
-                     :removed 0))
-              (cl-incf count))))))
-    count))
-
-;;;; Top-level command
+;;;; Command
 
 (defun sgn-import-desktop-available-p ()
   "Return non-nil if a Signal Desktop database is available to import."
-  (and (file-exists-p sgn-import--desktop-db-path)
+  (and (file-exists-p (sgn-import--desktop-db-path))
        (executable-find "sqlcipher")))
 
 ;;;###autoload
 (defun sgn-import-from-desktop ()
-  "Import message history from Signal Desktop into sgn's database.
-Requires `sqlcipher' CLI and a running Signal Desktop installation."
+  "Import text message history from Signal Desktop into sgn."
   (interactive)
-  (require 'sgn)
-  (unless sgn-db--connection
-    (user-error "sgn database not initialized; run M-x sgn-start first"))
-  (message "Exporting Signal Desktop database...")
-  (let ((tmp-db-path (sgn-import--export-to-plain-db)))
+  (sgn-ensure-running)
+  (message "Exporting Signal Desktop's database...")
+  (let ((export (sgn-import--export)))
     (unwind-protect
-        (let ((export-db (sqlite-open tmp-db-path)))
+        (let ((db (sqlite-open export)))
           (unwind-protect
-              (progn
-                (message "Building conversation mappings...")
-                (let ((mappings (sgn-import--build-mappings export-db)))
-                  (message "Importing messages...")
-                  (let ((msg-count (sgn-import--import-messages export-db mappings)))
-                    (message "Importing reactions...")
-                    (let ((rxn-count (sgn-import--import-reactions export-db mappings)))
-                      (sgn--log "sgn-import: imported %d messages, %d reactions"
-                                msg-count rxn-count)
-                      (message "Import complete: %d messages, %d reactions."
-                               msg-count rxn-count)))))
-            (sqlite-close export-db)))
-      (when (file-exists-p tmp-db-path)
-        (delete-file tmp-db-path)))))
+              (pcase-let ((`(,messages . ,reactions) (sgn-import--import db)))
+                (sgn--log "sgn-import: %d messages, %d reactions"
+                          messages reactions)
+                (message "Imported %d new messages and %d reactions."
+                         messages reactions))
+            (sqlite-close db)))
+      (when (file-exists-p export)
+        (delete-file export)))))
 
 (provide 'sgn-import)
 ;;; sgn-import.el ends here

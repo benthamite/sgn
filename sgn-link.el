@@ -21,7 +21,7 @@
 
 (declare-function sgn--log "sgn")
 (declare-function sgn-start "sgn")
-(declare-function sgn-rpc-stop "sgn-rpc")
+(declare-function sgn-stop "sgn")
 (declare-function sgn-import-desktop-available-p "sgn-import")
 (declare-function sgn-import-from-desktop "sgn-import")
 
@@ -64,7 +64,9 @@ the messages missed while unlinked from Signal Desktop."
     (user-error "The signal-cli executable `%s' was not found" sgn-cli-program))
   (when (get-process sgn-link--process-name)
     (delete-process sgn-link--process-name))
-  (sgn-rpc-stop)
+  ;; signal-cli locks the account while linking, so sgn must not
+  ;; start it again until linking is over.
+  (sgn-stop)
   (setq sgn-link--output "")
   (sgn-link--show "Waiting for signal-cli to produce a linking code...")
   (let ((proc (make-process
@@ -75,6 +77,16 @@ the messages missed while unlinked from Signal Desktop."
                :sentinel #'sgn-link--sentinel
                :coding 'utf-8-unix)))
     (set-process-query-on-exit-flag proc nil)))
+
+(defun sgn-link-in-progress-p ()
+  "Return non-nil while `sgn-link' is linking."
+  (process-live-p (get-process sgn-link--process-name)))
+
+(defun sgn-link--kill-process ()
+  "Stop linking when the linking buffer is killed."
+  (when-let* ((proc (get-process sgn-link--process-name)))
+    (set-process-sentinel proc #'ignore)
+    (delete-process proc)))
 
 (defun sgn-link--filter (_proc string)
   "Accumulate STRING and show the QR code once the linking URI arrives."
@@ -93,18 +105,22 @@ Only a complete line counts, since output can arrive in pieces."
   "Handle the end of the linking PROC, described by EVENT."
   (sgn--log "sgn-link: %s" (string-trim event))
   (unless (process-live-p proc)
-    (if (zerop (process-exit-status proc))
-        (sgn-link--finish)
+    (if (and (eq (process-status proc) 'exit)
+             (zerop (process-exit-status proc)))
+        ;; Leave the sentinel before asking questions.
+        (run-at-time 0 nil #'sgn-link--finish)
       (sgn-link--show
-       (format "Linking failed: %s\n\nRun M-x sgn-link to try again."
-               (sgn-link--last-line))))))
+       (format "Linking failed:\n\n%s\n\nRun M-x sgn-link to try again."
+               (sgn-link--error-output))))))
 
-(defun sgn-link--last-line ()
-  "Return the last line of linking output that is not the URI."
-  (or (car (last (cl-remove-if
-                  (lambda (line) (string-prefix-p "sgnl://" line))
-                  (split-string sgn-link--output "\n" t "[[:space:]]+"))))
-      "signal-cli exited with an error"))
+(defun sgn-link--error-output ()
+  "Return the linking output other than the URI."
+  (let ((output (string-join
+                 (cl-remove-if (lambda (line) (string-prefix-p "sgnl://" line))
+                               (split-string sgn-link--output "\n" t
+                                             "[[:space:]]+"))
+                 "\n")))
+    (if (string-empty-p output) "signal-cli exited with an error" output)))
 
 (defun sgn-link--finish ()
   "Restart sgn after a successful link and offer to fill the history gap."
@@ -133,14 +149,15 @@ Only a complete line counts, since output can arrive in pieces."
     (let ((inhibit-read-only t))
       (erase-buffer)
       (insert text "\n"))
-    (special-mode))
+    (special-mode)
+    (add-hook 'kill-buffer-hook #'sgn-link--kill-process nil t))
   (pop-to-buffer sgn-link--buffer-name))
 
 (defun sgn-link--show-qr (uri)
   "Display URI as a QR code with scanning instructions."
   (sgn-link--show
    "On your phone, open Signal > Settings > Linked devices > Link new device,
-and scan this code.  It expires after a few minutes.\n")
+and scan this code.  It expires after about two minutes.\n")
   (with-current-buffer sgn-link--buffer-name
     (let ((inhibit-read-only t))
       (goto-char (point-max))

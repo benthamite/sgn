@@ -8,7 +8,7 @@ A full-featured Signal messenger client for Emacs, built on `signal-cli`'s JSON-
 
 `sgn` lets you send and receive Signal messages without leaving Emacs. It communicates with a `signal-cli` daemon over JSON-RPC, persists all conversations in a local SQLite database with FTS5 indexing, and renders chat buffers in a telega-style layout with message grouping, inline images, and text properties for point-based commands.
 
-The package covers the core Signal messaging workflow: sending and receiving text, images, stickers, and voice notes; reacting to, quoting, editing, and deleting messages; creating and voting in polls; pinning messages; managing groups and contacts; and searching across your entire message history. A dashboard buffer provides an overview of all conversations with unread badges, last-message previews, and pinned chats.
+The package covers the core Signal messaging workflow: sending and receiving text and attachments, receiving images, stickers, and voice notes; reacting to, quoting, editing, and deleting messages; pinning messages; disappearing messages; managing groups and contacts; and searching across your entire message history. Every message you send shows whether Signal confirmed it. A dashboard buffer provides an overview of all conversations with unread badges, last-message previews, and pinned chats.
 
 `sgn` also supports importing your existing message history from Signal Desktop via its SQLCipher database, so you don't lose context when switching to an Emacs-based workflow.
 
@@ -50,7 +50,7 @@ No external Emacs package dependencies are required --- `sgn` uses only built-in
 
 Then:
 
-1. `M-x sgn-start` --- initializes the database, starts `signal-cli`, and opens the dashboard.
+1. `M-x sgn-dashboard` --- starts `sgn` (opening the database and starting `signal-cli`) and shows the list of chats.
 2. `M-x sgn-chat` --- pick a contact or group to open a chat buffer.
 3. Type your message and press `RET` to send.
 4. Move point to any message and press `r` to quote-reply, `R` to react, `e` to edit, or `d` to delete.

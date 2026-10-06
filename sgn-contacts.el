@@ -9,28 +9,78 @@
 
 ;;; Commentary:
 
-;; Contact and group cache backed by SQLite, with completing-read for
-;; chat selection.  Contacts are fetched from signal-cli on startup and
-;; periodically, then persisted in the `chats' table.
+;; Display names for people and groups, kept in an in-memory cache
+;; backed by the `recipients' and `chats' tables, the periodic refresh
+;; of contacts and groups from signal-cli, and `completing-read' over
+;; chats.  Names are only for display: chats and buffers are always
+;; identified by chat ID.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
+(require 'sgn-db)
 
 (declare-function sgn--log "sgn")
-(declare-function sgn-db-upsert-chat "sgn-db")
-(declare-function sgn-db-get-chat "sgn-db")
-(declare-function sgn-db-get-chats "sgn-db")
 (declare-function sgn-rpc-list-contacts "sgn-rpc")
 (declare-function sgn-rpc-list-groups "sgn-rpc")
+(declare-function sgn-rpc-alive-p "sgn-rpc")
+(declare-function sgn-store-self-p "sgn-store")
+(declare-function sgn-store-learn-self "sgn-store")
+(declare-function sgn-store-changed "sgn-store")
 
 (defvar sgn-account)
 
-;;;; Internal state
+;;;; Name cache
 
 (defvar sgn-contacts--cache (make-hash-table :test 'equal)
-  "Cache of Signal IDs to display names.
-Keys are phone numbers or base64 group IDs; values are display name strings.")
+  "Map from a person's or group's identifier to its display name.")
+
+(defvar sgn-contacts--numbers (make-hash-table :test 'equal)
+  "Map from a person's ACI to their phone number.")
+
+(defun sgn-contacts-load-from-db ()
+  "Fill the name cache from the database."
+  (clrhash sgn-contacts--cache)
+  (clrhash sgn-contacts--numbers)
+  (pcase-dolist (`(,uuid ,number ,name) (sgn-db-get-recipients))
+    (when number
+      (puthash uuid number sgn-contacts--numbers))
+    (when name
+      (puthash uuid name sgn-contacts--cache)
+      (when number
+        (puthash number name sgn-contacts--cache))))
+  (dolist (chat (sgn-db-get-chats t))
+    (when-let* ((name (plist-get chat :name)))
+      (unless (string-empty-p name)
+        (puthash (plist-get chat :id) name sgn-contacts--cache)))))
+
+(defun sgn-contacts-set-name (id name)
+  "Set display NAME for identifier ID."
+  (when (and id name (not (string-empty-p name)))
+    (puthash id name sgn-contacts--cache)))
+
+(defun sgn-contacts-name-known-p (id)
+  "Return non-nil if a display name is known for ID."
+  (gethash id sgn-contacts--cache))
+
+(defun sgn-contacts-get-name (id)
+  "Return the display name for the person or group ID."
+  (cond
+   ((sgn-store-self-p id) "Note to Self")
+   ((gethash id sgn-contacts--cache))
+   ((gethash id sgn-contacts--numbers))
+   ((string-match-p "\\`[0-9a-f]\\{8\\}-" id)
+    (format "Unknown (%s)" (substring id 0 8)))
+   (t id)))
+
+(defun sgn-contacts-display-sender (sender)
+  "Return the display string for message SENDER: \"You\" for this account."
+  (if (sgn-store-self-p sender)
+      "You"
+    (sgn-contacts-get-name sender)))
+
+;;;; Refresh from signal-cli
 
 (defvar sgn-contacts--refresh-timer nil
   "Timer for periodic contact refresh.")
@@ -38,206 +88,184 @@ Keys are phone numbers or base64 group IDs; values are display name strings.")
 (defconst sgn-contacts--refresh-interval 300
   "Seconds between automatic contact refreshes.")
 
-(defconst sgn-contacts--initial-delay 2
-  "Seconds to wait after process start before first contact refresh.")
-
-;;;; Name resolution
-
-(defun sgn-contacts-get-name (id)
-  "Return display name for signal ID, or ID itself as fallback."
-  (or (gethash id sgn-contacts--cache)
-      id))
-
-(defun sgn-contacts-set-name (id name)
-  "Set display NAME for signal ID in cache."
-  (when (and id name (not (string-empty-p name)))
-    (puthash id name sgn-contacts--cache)))
-
-(defun sgn-contacts-display-sender (sender)
-  "Return display string for SENDER.
-If SENDER matches `sgn-account', return \"You\"; otherwise resolve name."
-  (if (and sgn-account (equal sender sgn-account))
-      "You"
-    (sgn-contacts-get-name sender)))
-
-;;;; Refresh from signal-cli
-
 (defun sgn-contacts-refresh ()
-  "Fetch contacts and groups from signal-cli, update cache and database."
+  "Fetch contacts and groups from signal-cli and record them."
   (interactive)
-  (sgn-rpc-list-contacts #'sgn-contacts--populate-contacts)
-  (sgn-rpc-list-groups #'sgn-contacts--populate-groups))
+  (sgn-rpc-list-contacts #'sgn-contacts--record-contacts)
+  (sgn-rpc-list-groups #'sgn-contacts--record-groups))
 
-(defun sgn-contacts--populate-contacts (result)
-  "Populate cache and DB from a listContacts RESULT."
-  (let ((contacts (if (vectorp result) (append result nil) result)))
-    (dolist (contact contacts)
-      (let* ((number (sgn-contacts--non-empty-string (alist-get 'number contact)))
-             (uuid (sgn-contacts--non-empty-string (alist-get 'uuid contact)))
-             (name (sgn-contacts--display-name contact))
-             (id (or number uuid)))
-        (when (and id name)
-          (when number (sgn-contacts-set-name number name))
-          (when uuid (sgn-contacts-set-name uuid name))
-          (sgn-db-upsert-chat id :name name :type "individual")))))
-  (sgn--log "Contacts refreshed: %d entries" (hash-table-count sgn-contacts--cache)))
-
-(defun sgn-contacts--display-name (contact)
-  "Return best display name for CONTACT plist from listContacts.
-Falls back through saved name, profile name, and username; returns nil
-if no usable name is available."
-  (or (sgn-contacts--non-empty-string (alist-get 'name contact))
-      (sgn-contacts--profile-name (alist-get 'profile contact))
-      (sgn-contacts--non-empty-string (alist-get 'username contact))))
-
-(defun sgn-contacts--profile-name (profile)
-  "Return joined given+family name from PROFILE alist, or nil."
-  (when profile
-    (let ((given (or (alist-get 'givenName profile) ""))
-          (family (or (alist-get 'familyName profile) "")))
-      (sgn-contacts--non-empty-string
-       (string-trim (concat given " " family))))))
-
-(defun sgn-contacts--non-empty-string (s)
-  "Return S if it is a non-empty string, else nil."
-  (and (stringp s) (not (string-empty-p s)) s))
-
-(defun sgn-contacts--populate-groups (result)
-  "Populate cache and DB from a listGroups RESULT."
-  (let ((groups (if (vectorp result) (append result nil) result)))
-    (dolist (group groups)
-      (let ((group-id (alist-get 'id group))
-            (name (alist-get 'name group)))
-        (when group-id
-          (when (and name (not (string-empty-p name)))
-            (sgn-contacts-set-name group-id name))
-          (sgn-db-upsert-chat group-id
-                              :name (or name "")
-                              :type "group")))))
-  (sgn--log "Groups refreshed"))
-
-;;;; Periodic refresh
+(defun sgn-contacts--refresh-if-running ()
+  "Refresh contacts if signal-cli is running."
+  (when (sgn-rpc-alive-p)
+    (sgn-contacts-refresh)))
 
 (defun sgn-contacts-start-refresh-timer ()
-  "Start the periodic contact refresh timer."
+  "Refresh contacts now and then periodically."
   (sgn-contacts-stop-refresh-timer)
   (setq sgn-contacts--refresh-timer
-        (run-at-time sgn-contacts--initial-delay
-                     sgn-contacts--refresh-interval
-                     #'sgn-contacts-refresh)))
+        (run-at-time 0 sgn-contacts--refresh-interval
+                     #'sgn-contacts--refresh-if-running)))
 
 (defun sgn-contacts-stop-refresh-timer ()
-  "Stop the periodic contact refresh timer."
+  "Stop the periodic contact refresh."
   (when sgn-contacts--refresh-timer
     (cancel-timer sgn-contacts--refresh-timer)
     (setq sgn-contacts--refresh-timer nil)))
 
-;;;; Completing-read interface
+(defun sgn-contacts--record-contacts (contacts)
+  "Record the people in CONTACTS, a listContacts result."
+  (let ((changed nil))
+    (sgn-db-with-transaction
+      (dolist (contact contacts)
+        (let ((uuid (sgn-contacts--non-empty (alist-get 'uuid contact)))
+              (number (sgn-contacts--non-empty (alist-get 'number contact)))
+              (name (sgn-contacts--display-name contact)))
+          (when uuid
+            (when (equal number sgn-account)
+              (sgn-store-learn-self uuid))
+            (unless (equal name (gethash uuid sgn-contacts--cache))
+              (push uuid changed))
+            (sgn-db-upsert-recipient uuid number name)
+            (when number
+              (puthash uuid number sgn-contacts--numbers)
+              (when (sgn-db-merge-identity number uuid)
+                (push uuid changed)))
+            (when name
+              (sgn-contacts-set-name uuid name)
+              (when number
+                (sgn-contacts-set-name number name)))))))
+    (sgn--log "Contacts refreshed: %d" (length contacts))
+    (when changed
+      (apply #'sgn-store-changed (delete-dups changed)))))
 
-(defun sgn-contacts--is-group-id (id)
-  "Return non-nil if ID looks like a Signal group ID.
-Phone numbers start with \"+\", UUIDs contain \"-\"; anything else
-is assumed to be a base64 group ID."
-  (not (or (string-prefix-p "+" id)
-           (string-match-p "-" id))))
+(defun sgn-contacts--display-name (contact)
+  "Return the best display name for CONTACT, a listContacts entry, or nil."
+  (or (sgn-contacts--non-empty (alist-get 'nickName contact))
+      (sgn-contacts--non-empty (alist-get 'name contact))
+      (sgn-contacts--profile-name (alist-get 'profile contact))
+      (sgn-contacts--non-empty (alist-get 'username contact))))
 
-(defun sgn-contacts-completing-read (&optional prompt)
-  "Read a chat ID via `completing-read' with annotations.
-PROMPT defaults to \"Chat: \".  Returns the selected chat ID (not the
-display name).  Candidates are sorted by recency (most recent
-conversation first), with duplicate names disambiguated."
-  (let* ((chats (sgn-db-get-chats t))
-         (candidates (sgn-contacts--build-candidates chats))
-         (selected (completing-read
-                    (or prompt "Chat: ")
-                    (sgn-contacts--completion-table candidates)
-                    nil nil nil nil nil)))
-    (or (cdr (assoc selected candidates))
-        ;; If no match, treat input as a raw phone number
-        selected)))
+(defun sgn-contacts--profile-name (profile)
+  "Return the full name in PROFILE, or nil."
+  (when profile
+    (sgn-contacts--non-empty
+     (string-trim (concat (or (alist-get 'givenName profile) "") " "
+                          (or (alist-get 'familyName profile) ""))))))
 
-(defun sgn-contacts--build-candidates (chats)
-  "Build alist of (display-string . chat-id) from CHATS plists.
-Disambiguate duplicate display names."
-  (let ((name-counts (make-hash-table :test 'equal))
-        (raw-entries nil))
-    ;; First pass: count name occurrences for disambiguation
-    (dolist (chat chats)
-      (let* ((id (plist-get chat :id))
-             (name (or (plist-get chat :name)
-                       (sgn-contacts-get-name id))))
-        (push (cons name id) raw-entries)
-        (puthash name (1+ (or (gethash name name-counts) 0)) name-counts)))
-    (setq raw-entries (nreverse raw-entries))
-    ;; Second pass: disambiguate duplicates
-    (mapcar
-     (lambda (entry)
-       (let ((name (car entry))
-             (id (cdr entry)))
-         (if (> (gethash name name-counts 0) 1)
-             ;; Disambiguate: append short ID hint
-             (let ((suffix (if (sgn-contacts--is-group-id id)
-                               (concat " <" (substring id 0 (min 8 (length id))) "…>")
-                             (concat " <" id ">"))))
-               (cons (concat name suffix) id))
-           (cons name id))))
-     raw-entries)))
+(defun sgn-contacts--non-empty (s)
+  "Return S if it is a non-empty string, else nil."
+  (and (stringp s) (not (string-empty-p s)) s))
 
-(defun sgn-contacts--completion-table (candidates)
-  "Build a completion table from CANDIDATES with annotations.
-CANDIDATES is an alist of (display-string . chat-id)."
-  (let ((table (make-hash-table :test 'equal)))
-    (dolist (cand candidates)
-      (puthash (car cand) (cdr cand) table))
-    (lambda (string pred action)
+(defun sgn-contacts--record-groups (groups)
+  "Record the groups in GROUPS, a listGroups result."
+  (let ((changed nil))
+    (sgn-db-with-transaction
+      (dolist (group groups)
+        (when-let* ((id (alist-get 'id group)))
+          (let ((name (sgn-contacts--non-empty (alist-get 'name group))))
+            (sgn-db-ensure-chat id "group")
+            (unless (equal name (plist-get (sgn-db-get-chat id) :name))
+              (sgn-db-update-chat id :name name)
+              (push id changed))
+            (sgn-contacts-set-name id name)
+            (dolist (member (alist-get 'members group))
+              (when-let* ((uuid (alist-get 'uuid member)))
+                (when (equal (alist-get 'number member) sgn-account)
+                  (sgn-store-learn-self uuid))))))))
+    (when changed
+      (apply #'sgn-store-changed changed))))
+
+;;;; Completing-read
+
+(defun sgn-contacts-completing-read (&optional prompt allow-empty)
+  "Read a chat with `completing-read' and return its ID.
+PROMPT defaults to \"Chat: \".  Candidates are chats, most recent
+first, and contacts without a chat.  A phone number not among
+them is also accepted.  With ALLOW-EMPTY, empty input returns nil."
+  (let* ((candidates (sgn-contacts--candidates))
+         (table (make-hash-table :test 'equal)))
+    (dolist (candidate candidates)
+      (puthash (car candidate) (cdr candidate) table))
+    (let ((choice (completing-read (or prompt "Chat: ")
+                                   (sgn-contacts--completion-table
+                                    (mapcar #'car candidates) table)
+                                   nil 'confirm)))
       (cond
-       ((eq action 'metadata)
-        `(metadata
-          (annotation-function . ,(sgn-contacts--annotation-fn))
-          (category . sgn-chat)))
-       (t
-        (complete-with-action action table string pred))))))
+       ((plist-get (gethash choice table) :id))
+       ((and allow-empty (string-empty-p choice)) nil)
+       (t (sgn-contacts--read-number choice))))))
 
-(defun sgn-contacts--annotation-fn ()
-  "Return an annotation function for chat candidates.
-Shows last message preview and timestamp."
-  (lambda (candidate)
-    (let* ((chats (sgn-db-get-chats t))
-           (chat (cl-find-if (lambda (c)
-                               (let ((name (or (plist-get c :name)
-                                               (sgn-contacts-get-name (plist-get c :id)))))
-                                 (string-prefix-p name candidate)))
-                             chats))
-           (ts (and chat (plist-get chat :last-msg-ts)))
-           (unread (and chat (plist-get chat :unread))))
-      (concat
-       (when (and unread (> unread 0))
-         (format " (%d)" unread))
-       (when ts
-         (format " · %s" (sgn-contacts--format-relative-time ts)))))))
+(defun sgn-contacts--read-number (input)
+  "Return the chat ID for phone number INPUT, or signal an error."
+  (let ((number (replace-regexp-in-string "[ ()-]" "" input)))
+    (unless (string-match-p "\\`\\+[0-9]\\{6,15\\}\\'" number)
+      (user-error "No chat named %s (phone numbers need a leading +)" input))
+    (or (sgn-db-uuid-for-number number) number)))
 
-(defun sgn-contacts--format-relative-time (timestamp-ms)
-  "Format TIMESTAMP-MS (milliseconds) as a relative time string."
-  (let* ((now (float-time))
-         (then (/ timestamp-ms 1000.0))
-         (diff (- now then)))
-    (cond
-     ((< diff 60) "now")
-     ((< diff 3600) (format "%dm ago" (floor (/ diff 60))))
-     ((< diff 86400) (format "%dh ago" (floor (/ diff 3600))))
-     ((< diff 604800) (format "%dd ago" (floor (/ diff 86400))))
-     (t (format-time-string "%b %d" (seconds-to-time then))))))
-
-;;;; Warm cache from database on startup
-
-(defun sgn-contacts-load-from-db ()
-  "Load contact names from the database into the in-memory cache."
-  (let ((chats (sgn-db-get-chats t)))
+(defun sgn-contacts--candidates ()
+  "Return (DISPLAY . PLIST) for chats and contacts, most recent first.
+PLIST has the chat's :id, :type, :unread and :last-msg-ts."
+  (let* ((chats (sgn-db-get-chats t))
+         (chat-ids (make-hash-table :test 'equal))
+         (entries nil))
     (dolist (chat chats)
-      (let ((id (plist-get chat :id))
-            (name (plist-get chat :name)))
-        (when (and id name (not (string-empty-p name)))
-          (puthash id name sgn-contacts--cache))))))
+      (puthash (plist-get chat :id) t chat-ids)
+      (push chat entries))
+    (pcase-dolist (`(,uuid ,_number ,_name) (sgn-db-get-recipients))
+      (unless (gethash uuid chat-ids)
+        (push (list :id uuid :type "individual") entries)))
+    (sgn-contacts--disambiguate
+     (sort (nreverse entries)
+           (lambda (a b) (> (or (plist-get a :last-msg-ts) 0)
+                            (or (plist-get b :last-msg-ts) 0)))))))
+
+(defun sgn-contacts--disambiguate (entries)
+  "Return (DISPLAY . ENTRY) for ENTRIES, with unique DISPLAY strings."
+  (let ((counts (make-hash-table :test 'equal)))
+    (dolist (entry entries)
+      (cl-incf (gethash (sgn-contacts-get-name (plist-get entry :id)) counts 0)))
+    (mapcar (lambda (entry)
+              (let* ((id (plist-get entry :id))
+                     (name (sgn-contacts-get-name id)))
+                (cons (if (> (gethash name counts) 1)
+                          (format "%s <%s>" name
+                                  (or (gethash id sgn-contacts--numbers)
+                                      (substring id 0 (min 8 (length id)))))
+                        name)
+                      entry)))
+            entries)))
+
+(defun sgn-contacts--completion-table (names table)
+  "Return a completion table over NAMES, keeping their order.
+TABLE maps each name to its entry, for annotations."
+  (lambda (string pred action)
+    (if (eq action 'metadata)
+        `(metadata
+          (category . sgn-chat)
+          (display-sort-function . identity)
+          (annotation-function
+           . ,(lambda (candidate)
+                (sgn-contacts--annotation (gethash candidate table)))))
+      (complete-with-action action names string pred))))
+
+(defun sgn-contacts--annotation (entry)
+  "Return the completion annotation for chat ENTRY."
+  (let ((unread (or (plist-get entry :unread) 0))
+        (ts (plist-get entry :last-msg-ts)))
+    (concat (when (> unread 0) (format " (%d)" unread))
+            (when ts (format " · %s" (sgn-contacts-format-time ts))))))
+
+(defun sgn-contacts-format-time (timestamp-ms &optional with-time)
+  "Return TIMESTAMP-MS formatted for lists of chats or messages.
+Today's times show the hour, this week's the weekday, older ones
+the date.  With WITH-TIME, weekdays and dates include the hour."
+  (let* ((time (/ timestamp-ms 1000.0))
+         (age (- (float-time) time)))
+    (format-time-string
+     (cond ((< age 86400) "%H:%M")
+           ((< age 604800) (if with-time "%a %H:%M" "%a"))
+           (t (if with-time "%b %d, %H:%M" "%b %d")))
+     time)))
 
 (provide 'sgn-contacts)
 ;;; sgn-contacts.el ends here

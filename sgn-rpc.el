@@ -22,20 +22,19 @@
 
 ;;; Commentary:
 
-;; This module manages the signal-cli JSON-RPC subprocess for sgn.  It
-;; handles process lifecycle (start, stop, health check), sending
-;; JSON-RPC requests with callback support, parsing incoming JSON
-;; responses, dispatching received messages and errors, and providing
-;; convenience functions for all supported signal-cli RPC methods.
+;; This module manages the signal-cli JSON-RPC subprocess for sgn: its
+;; lifecycle, the framing of requests and responses, and the
+;; bookkeeping of requests waiting for a reply.
 ;;
-;; The process is started with `--receive-mode=manual' so that no
-;; messages are delivered until `sgn-rpc-subscribe-receive' is called.
-;; This prevents message loss during initialization (contact loading,
-;; group syncing, etc.).
+;; signal-cli runs as `signal-cli -a ACCOUNT jsonRpc' and talks over a
+;; pipe.  Each request is recorded as an `sgn-rpc--request' until its
+;; reply arrives.  A reply calls the request's callback; an error reply
+;; calls its error callback, or reports the error.  When the process
+;; stops, every pending request's error callback is called with an
+;; `abandoned' error, since its reply can no longer arrive.
 ;;
-;; Error classification distinguishes transient errors (I/O, rate
-;; limiting) from permanent ones (invalid params, untrusted identity),
-;; and automatically retries idempotent operations on transient failure.
+;; Requests are never retried: a send whose reply was lost may still
+;; have been delivered, and sending it again could duplicate it.
 
 ;;; Code:
 
@@ -44,261 +43,251 @@
 (require 'subr-x)
 
 (declare-function sgn--log "sgn")
-(declare-function sgn-start "sgn")
 
 ;; Variables defined in sgn.el, referenced here.
 (defvar sgn-account)
 (defvar sgn-cli-program)
-(defvar sgn-data-directory)
 
 ;;; Constants
 
 (defconst sgn-rpc--process-name "signal-rpc"
   "Internal name for the signal-cli JSON-RPC process.")
 
-(defconst sgn-rpc--buffer-stderr " *sgn-stderr*"
-  "Name of the hidden buffer used for process stderr.")
+(defconst sgn-rpc--stderr-buffer-name " *sgn-stderr*"
+  "Name of the hidden buffer that collects signal-cli's stderr.")
 
-(defconst sgn-rpc--max-partial-line-length 100000
-  "Maximum bytes to buffer before discarding an incomplete JSON line.
-Prevents unbounded memory growth if signal-cli emits a very long
-line without a terminating newline.")
+(defconst sgn-rpc--max-partial-line-length (* 64 1024 1024)
+  "Maximum length of an incomplete line before it is discarded.
+Complete lines are never discarded; this only bounds the memory
+used by a line signal-cli never terminates.")
 
-(defconst sgn-rpc--retry-delay 2
-  "Seconds to wait before retrying a transient RPC error.")
-
-(defconst sgn-rpc--idempotent-methods '("send" "sendReaction" "sendReceipt" "sendTyping")
-  "RPC methods that are safe to retry on transient errors.
-These methods produce the same result whether executed once or
-twice, so automatic retry on I/O or rate-limit errors is safe.")
-
-(defconst sgn-rpc--retryable-error-codes '(-3 -5)
-  "JSON-RPC error codes considered transient and retryable.
--3 is an I/O error and -5 is a rate-limit error from signal-cli.")
-
-(defconst sgn-rpc--permanent-error-codes '(-1 -4 -32602 -32601)
-  "JSON-RPC error codes considered permanent and non-retryable.
--1 is a user error, -4 is an untrusted identity key, -32602 is
-invalid params, and -32601 is method not found.")
-
-;;; Handler variables
+;;; Configuration
 
 (defvar sgn-rpc-receive-handler nil
-  "Function called with (params) when a \"receive\" method arrives.
-Set by `sgn.el' during initialization to orchestrate message handling.")
-
-(defvar sgn-rpc-error-handler nil
-  "Function called with (id error-obj) for RPC errors.
-If nil, errors are logged but not reported to a buffer.")
-
-;;; Internal state
-
-(defvar sgn-rpc--id-counter 0
-  "Monotonically increasing counter for JSON-RPC request IDs.")
-
-(defvar sgn-rpc--pending-callbacks (make-hash-table :test 'equal)
-  "Mapping of RPC request ID to callback function.
-Each callback is called with the result value when a successful
-response arrives for that ID.")
-
-(defvar sgn-rpc--pending-error-callbacks (make-hash-table :test 'equal)
-  "Mapping of RPC request ID to error callback function.
-Each callback is called with the error object when the request
-fails for good, or when signal-cli stops before replying.")
-
-(defvar sgn-rpc--request-methods (make-hash-table :test 'equal)
-  "Mapping of RPC request ID to method name.
-Used by the error handler to determine whether a failed request
-is safe to retry (i.e. the method is idempotent).")
-
-(defvar sgn-rpc--request-params (make-hash-table :test 'equal)
-  "Mapping of RPC request ID to params alist.
-Stored alongside the method name so that transient errors can be
-retried with the original parameters.")
-
-(defvar sgn-rpc--retried-ids (make-hash-table :test 'equal)
-  "Set of RPC request IDs that have already been retried once.
-Prevents infinite retry loops: each request is retried at most once.")
-
-(defvar sgn-rpc--partial-line ""
-  "Buffer string for incomplete JSON lines received from the process.
-The process filter accumulates data here until a complete
-newline-terminated JSON object is available for parsing.")
-
-(defvar sgn-rpc--last-output nil
-  "Most recent non-JSON line printed by signal-cli.
-signal-cli reports fatal errors, such as an unregistered account,
-as plain text before exiting.")
-
-(defvar sgn-rpc--failure nil
-  "Description of the last abnormal exit of signal-cli, or nil.
-While non-nil, `sgn-rpc-send' signals this failure instead of
-restarting the process.  `sgn-rpc-start' clears it.")
+  "Function called with the params of each \"receive\" notification.")
 
 (defvar sgn-rpc-failure-change-hook nil
   "Hook run after `sgn-rpc--failure' is set or cleared.")
+
+;;; Internal state
+
+(cl-defstruct (sgn-rpc--request (:constructor sgn-rpc--request-create)
+                                (:copier nil))
+  "A JSON-RPC request waiting for its reply."
+  (id nil :documentation "The request's JSON-RPC id.")
+  (method nil :documentation "The JSON-RPC method name.")
+  (callback nil :documentation "Function called with the result.")
+  (error-callback nil :documentation "Function called with the error object."))
+
+(defvar sgn-rpc--id-counter 0
+  "Counter for JSON-RPC request IDs.")
+
+(defvar sgn-rpc--pending (make-hash-table :test 'eql)
+  "Map from request ID to its `sgn-rpc--request'.")
+
+(defvar sgn-rpc--partial-line ""
+  "Output received after the last newline from signal-cli.")
+
+(defvar sgn-rpc--failure nil
+  "Description of the last abnormal exit of signal-cli, or nil.
+`sgn-rpc-start' clears it.")
 
 ;;; Lifecycle
 
 (defun sgn-rpc-start ()
   "Start the signal-cli JSON-RPC subprocess.
-Cleans up any existing process state before starting.  In jsonRpc
-mode, signal-cli receives messages automatically."
+Any previous process is stopped first.  The process talks over a
+pipe: a pty's line discipline would truncate long requests."
   (unless sgn-cli-program
     (user-error "Variable `sgn-cli-program' is not set"))
   (unless (executable-find sgn-cli-program)
-    (user-error "The signal-cli executable '%s' was not found.\
- Please install it or check `sgn-cli-program'" sgn-cli-program))
+    (user-error "The signal-cli executable `%s' was not found" sgn-cli-program))
   (unless sgn-account
     (user-error "Variable `sgn-account' is not set"))
-  ;; Clean up old process if still lingering.
-  (when (get-process sgn-rpc--process-name)
-    (delete-process sgn-rpc--process-name))
-  ;; Reset all state.
+  (sgn-rpc-stop)
   (setq sgn-rpc--partial-line "")
-  (setq sgn-rpc--last-output nil)
   (sgn-rpc--set-failure nil)
-  (sgn-rpc--abandon-pending)
-  ;; Start the process.  It must use a pipe: a pty's line discipline
-  ;; drops input beyond 1024 bytes per line on macOS, so a long
-  ;; request (such as a reply quoting a long message) would never
-  ;; reach signal-cli, and every later request would pile onto it.
   (let ((proc (make-process
                :name sgn-rpc--process-name
-               :buffer sgn-rpc--buffer-stderr
+               :command (list sgn-cli-program "-a" sgn-account "jsonRpc")
                :connection-type 'pipe
-               :command (list sgn-cli-program
-                             "-a" sgn-account
-                             "jsonRpc")
+               :stderr (sgn-rpc--fresh-stderr-buffer)
                :filter #'sgn-rpc--process-filter
                :sentinel #'sgn-rpc--process-sentinel
-               :coding 'utf-8-unix)))
-    (set-process-query-on-exit-flag proc nil)
-    (sgn--log "sgn RPC process started.")
-    (message "sgn service started.")))
+               :coding 'utf-8-unix
+               :noquery t)))
+    (sgn--log "signal-cli started (pid %s)." (process-id proc))))
+
+(defun sgn-rpc--fresh-stderr-buffer ()
+  "Return the stderr buffer, emptied."
+  (let ((buf (get-buffer-create sgn-rpc--stderr-buffer-name)))
+    (with-current-buffer buf
+      (erase-buffer))
+    buf))
 
 (defun sgn-rpc-stop ()
-  "Stop the signal-cli JSON-RPC subprocess."
-  (when (get-process sgn-rpc--process-name)
-    (delete-process sgn-rpc--process-name)
-    (sgn--log "sgn RPC process stopped.")
-    (message "sgn service stopped."))
+  "Stop the signal-cli JSON-RPC subprocess and abandon pending requests."
+  (when-let* ((proc (get-process sgn-rpc--process-name)))
+    ;; Detach the sentinel first: a stop is deliberate, not a failure.
+    (set-process-sentinel proc #'ignore)
+    (delete-process proc)
+    (sgn--log "signal-cli stopped."))
   (sgn-rpc--abandon-pending))
-
-(defun sgn-rpc--abandon-pending ()
-  "Forget all pending requests, calling their error callbacks first.
-signal-cli will not reply to requests sent to a process that has
-stopped, so callers waiting on them are told they were abandoned:
-the error object passed to their error callbacks has a non-nil
-`abandoned' entry."
-  (let ((error-callbacks (hash-table-values sgn-rpc--pending-error-callbacks)))
-    (clrhash sgn-rpc--pending-callbacks)
-    (clrhash sgn-rpc--pending-error-callbacks)
-    (clrhash sgn-rpc--request-methods)
-    (clrhash sgn-rpc--request-params)
-    (clrhash sgn-rpc--retried-ids)
-    (dolist (callback error-callbacks)
-      (funcall callback '((message . "signal-cli stopped before replying")
-                          (abandoned . t))))))
 
 (defun sgn-rpc-alive-p ()
   "Return non-nil if the signal-cli JSON-RPC process is running."
-  (and (get-process sgn-rpc--process-name)
-       (process-live-p (get-process sgn-rpc--process-name))))
+  (when-let* ((proc (get-process sgn-rpc--process-name)))
+    (process-live-p proc)))
 
-;;; Generic send
+(defun sgn-rpc--abandon-pending ()
+  "Forget all pending requests, calling their error callbacks.
+The error object passed has a non-nil `abandoned' entry, because
+the request may or may not have taken effect."
+  (let ((requests (hash-table-values sgn-rpc--pending)))
+    (clrhash sgn-rpc--pending)
+    (dolist (request requests)
+      (when-let* ((errback (sgn-rpc--request-error-callback request)))
+        (sgn-rpc--call-safely
+         errback '((message . "signal-cli stopped before replying")
+                   (abandoned . t)))))))
+
+;;; Sending
 
 (defun sgn-rpc-send (method params &optional callback error-callback)
-  "Send a JSON-RPC request with METHOD and PARAMS.
-Return the integer request ID.  If CALLBACK is non-nil, it is
-called with the result value when a successful response arrives.
-If ERROR-CALLBACK is non-nil, it is called with the error object
-when the request fails for good or signal-cli stops before
-replying.  The method name is stored alongside the callback so
-the error handler can determine retry eligibility."
+  "Send a JSON-RPC request for METHOD with PARAMS.
+CALLBACK, if non-nil, is called with the result.  ERROR-CALLBACK,
+if non-nil, is called with the error object when signal-cli
+reports an error or stops before replying; without one, errors
+are logged and shown in the echo area.  Signal a `user-error' if
+signal-cli is not running.  Return the request ID."
   (unless (sgn-rpc-alive-p)
-    (sgn-rpc--ensure-running))
+    (user-error "%s" (or (sgn-rpc-failure-advice)
+                         "sgn is not running; run M-x sgn-start")))
   (let* ((id (cl-incf sgn-rpc--id-counter))
-         (req `((jsonrpc . "2.0")
-                (method . ,method)
-                (params . ,params)
-                (id . ,id)))
-         (json-str (json-encode req)))
-    (puthash id method sgn-rpc--request-methods)
-    (puthash id params sgn-rpc--request-params)
-    (when callback
-      (puthash id callback sgn-rpc--pending-callbacks))
-    (when error-callback
-      (puthash id error-callback sgn-rpc--pending-error-callbacks))
+         (json-str (json-encode `((jsonrpc . "2.0")
+                                  (method . ,method)
+                                  (params . ,params)
+                                  (id . ,id)))))
+    (puthash id (sgn-rpc--request-create :id id :method method
+                                         :callback callback
+                                         :error-callback error-callback)
+             sgn-rpc--pending)
     (sgn--log "SEND: %s" json-str)
     (process-send-string sgn-rpc--process-name (concat json-str "\n"))
     id))
 
-(defun sgn-rpc--ensure-running ()
-  "Start sgn when the RPC process is not running.
-If signal-cli exited abnormally, signal that failure instead: a
-restart would fail the same way, and `sgn-start' schedules RPC
-sends of its own, so restarting here would loop."
-  (when sgn-rpc--failure
-    (user-error "%s" (sgn-rpc-failure-advice)))
-  (sgn--log "sgn service not running; starting before RPC send.")
-  (sgn-start)
-  (unless (sgn-rpc-alive-p)
-    (user-error "sgn service did not start")))
-
 ;;; Process filter and parsing
 
 (defun sgn-rpc--process-filter (_proc string)
-  "Accumulate process output and parse complete JSON objects from STRING.
-Incomplete lines are buffered in `sgn-rpc--partial-line' until a
-newline delimiter arrives.  An overflow guard discards data if the
-buffer exceeds `sgn-rpc--max-partial-line-length'."
-  (setq sgn-rpc--partial-line (concat sgn-rpc--partial-line string))
-  ;; Overflow protection: discard if buffer grows too large.
-  (when (> (length sgn-rpc--partial-line) sgn-rpc--max-partial-line-length)
-    (setq sgn-rpc--partial-line "")
-    (sgn--log "WARNING: Buffer overflow protection triggered.  Dropped data."))
-  (let ((lines (split-string sgn-rpc--partial-line "\n")))
-    ;; If the accumulated data ends with a newline, all lines are complete.
-    ;; Otherwise, the last element is an incomplete line to carry over.
-    (if (string-suffix-p "\n" sgn-rpc--partial-line)
-        (setq sgn-rpc--partial-line "")
-      (setq sgn-rpc--partial-line (car (last lines)))
-      (setq lines (butlast lines)))
-    (dolist (line lines)
-      (setq line (string-trim line))
-      (cond
-       ((string-empty-p line))
-       ((string-prefix-p "{" line)
-        (sgn--log "RECV: %s" line)
-        (condition-case err
-            (let ((json (json-read-from-string line)))
-              (sgn-rpc--dispatch json))
-          (error (sgn--log "JSON parse error: %s" err))))
-       (t
-        (setq sgn-rpc--last-output line)
-        (sgn--log "OUTPUT: %s" line))))))
+  "Parse complete lines of STRING received from signal-cli.
+The text after the last newline is kept for the next call."
+  (let* ((data (concat sgn-rpc--partial-line string))
+         (lines (split-string data "\n")))
+    (setq sgn-rpc--partial-line (car (last lines)))
+    (when (> (length sgn-rpc--partial-line) sgn-rpc--max-partial-line-length)
+      (sgn--log "WARNING: discarding an unterminated line of %d characters"
+                (length sgn-rpc--partial-line))
+      (setq sgn-rpc--partial-line ""))
+    (dolist (line (butlast lines))
+      (sgn-rpc--handle-line (string-trim line)))))
+
+(defun sgn-rpc--handle-line (line)
+  "Parse LINE from signal-cli's stdout and dispatch it."
+  (cond
+   ((string-empty-p line))
+   ((not (string-prefix-p "{" line))
+    (sgn--log "OUTPUT: %s" line))
+   (t
+    (sgn--log "RECV: %s" line)
+    (let ((json (condition-case err
+                    (sgn-rpc-parse-json line)
+                  (json-parse-error
+                   (sgn--log "JSON parse error: %S" err)
+                   nil))))
+      (when json
+        (sgn-rpc--dispatch json))))))
+
+(defun sgn-rpc-parse-json (string)
+  "Parse the JSON in STRING the way sgn reads signal-cli output.
+Objects become alists, arrays lists, and null and false nil."
+  (json-parse-string string :object-type 'alist :array-type 'list
+                     :null-object nil :false-object nil))
+
+(defun sgn-rpc--dispatch (json)
+  "Route the parsed JSON message to its handler.
+Errors raised by handlers are logged and shown, and do not stop
+the handling of later messages."
+  (let ((id (alist-get 'id json)))
+    (cond
+     ((equal (alist-get 'method json) "receive")
+      (when sgn-rpc-receive-handler
+        (sgn-rpc--call-safely sgn-rpc-receive-handler
+                              (alist-get 'params json))))
+     ((not id))
+     ((assq 'error json)
+      (sgn-rpc--handle-error id (alist-get 'error json)))
+     (t
+      (sgn-rpc--handle-result id (alist-get 'result json))))))
+
+(defun sgn-rpc--call-safely (function &rest args)
+  "Call FUNCTION with ARGS, logging and showing any error it signals."
+  (condition-case err
+      (apply function args)
+    (error
+     (sgn--log "ERROR in %S: %S" function err)
+     (message "sgn: internal error: %s" (error-message-string err)))))
+
+(defun sgn-rpc--handle-result (id result)
+  "Pass RESULT to the callback of the pending request ID."
+  (when-let* ((request (gethash id sgn-rpc--pending)))
+    (remhash id sgn-rpc--pending)
+    (when-let* ((callback (sgn-rpc--request-callback request)))
+      (sgn-rpc--call-safely callback result))))
+
+(defun sgn-rpc--handle-error (id error-obj)
+  "Pass ERROR-OBJ to the error callback of the pending request ID.
+Without an error callback, log the error and show it."
+  (let ((request (gethash id sgn-rpc--pending))
+        (msg (alist-get 'message error-obj)))
+    (remhash id sgn-rpc--pending)
+    (sgn--log "RPC error [id=%s method=%s code=%s]: %s"
+              id (and request (sgn-rpc--request-method request))
+              (alist-get 'code error-obj) msg)
+    (cond
+     ((null request))
+     ((sgn-rpc--request-error-callback request)
+      (sgn-rpc--call-safely (sgn-rpc--request-error-callback request)
+                            error-obj))
+     (t
+      (message "sgn: %s failed: %s" (sgn-rpc--request-method request) msg)))))
+
+;;; Failure reporting
 
 (defun sgn-rpc--process-sentinel (proc event)
-  "Log process EVENT for PROC and report abnormal exits.
-An abnormal exit is recorded in `sgn-rpc--failure', together with
-the last text signal-cli printed.  When the current signal-cli
-process ends, its pending requests are abandoned."
+  "Record the abnormal end of PROC, described by EVENT.
+Pending requests are abandoned whenever the process ends."
   (sgn--log "Process event: %s" (string-trim event))
-  (when (and proc
-             (not (process-live-p proc))
-             (eq proc (get-process sgn-rpc--process-name)))
-    (sgn-rpc--abandon-pending))
-  (cond
-   ((string-prefix-p "exited abnormally" event)
-    (sgn-rpc--set-failure
-     (format "signal-cli %s%s" (string-trim event)
-             (if sgn-rpc--last-output
-                 (format ": %s" sgn-rpc--last-output)
-               "")))
-    (message "sgn: %s" (sgn-rpc-failure-advice)))
-   ((string-prefix-p "exited" event)
-    (message "sgn process exited."))))
+  (unless (process-live-p proc)
+    (unless (and (eq (process-status proc) 'exit)
+                 (zerop (process-exit-status proc)))
+      (sgn-rpc--set-failure
+       (format "signal-cli %s%s" (string-trim event)
+               (if-let* ((output (sgn-rpc--last-output)))
+                   (format ": %s" output)
+                 ""))))
+    (sgn-rpc--abandon-pending)
+    (message "sgn: %s" (or (sgn-rpc-failure-advice) "signal-cli exited"))))
+
+(defun sgn-rpc--last-output ()
+  "Return the last line signal-cli wrote to stderr, or nil.
+signal-cli reports fatal errors, such as an unregistered account,
+there before exiting."
+  (when-let* ((buf (get-buffer sgn-rpc--stderr-buffer-name)))
+    (with-current-buffer buf
+      (let ((lines (split-string (buffer-string) "\n" t "[[:space:]]+")))
+        (car (last (cl-remove-if
+                    (lambda (line) (string-prefix-p "Process " line))
+                    lines)))))))
 
 (defun sgn-rpc--set-failure (failure)
   "Set `sgn-rpc--failure' to FAILURE and run the change hook if it changed."
@@ -319,236 +308,80 @@ after which signal-cli reports the account as not registered."
     (format "%s; run M-x %s" (string-remove-suffix "." sgn-rpc--failure)
             (if (sgn-rpc-unlinked-p) "sgn-link" "sgn-start"))))
 
-;;; Dispatch
+;;; Addressing
 
-(defun sgn-rpc--dispatch (json)
-  "Route a parsed JSON response to the appropriate handler.
-Incoming notifications (method = \"receive\") are forwarded to
-`sgn-rpc-receive-handler'.  Error responses are handled with
-retry logic for transient failures.  Successful results invoke
-their pending callback."
-  (let ((method (alist-get 'method json))
-        (error-obj (alist-get 'error json))
-        (id (alist-get 'id json))
-        (result (alist-get 'result json))
-        (params (alist-get 'params json)))
-    (cond
-     ;; Incoming message notification from signal-cli.
-     ((equal method "receive")
-      (if sgn-rpc-receive-handler
-          (funcall sgn-rpc-receive-handler params)
-        (sgn--log "Received message but no receive handler is set.")))
-     ;; RPC error response.
-     (error-obj
-      (sgn-rpc--handle-error id error-obj))
-     ;; Successful RPC result.
-     ((and id result)
-      (sgn-rpc--handle-result id result))
-     ;; Result may be null/empty for void methods; still clean up.
-     (id
-      (sgn-rpc--handle-result id result)))))
-
-;;; Error handling and retry
-
-(defun sgn-rpc--retryable-error-p (code)
-  "Return non-nil if error CODE is transient and retryable."
-  (memq code sgn-rpc--retryable-error-codes))
-
-(defun sgn-rpc--handle-error (id error-obj)
-  "Handle a JSON-RPC error response for request ID with ERROR-OBJ.
-For transient errors on idempotent methods that have not already
-been retried, schedule a single retry after `sgn-rpc--retry-delay'
-seconds.  For permanent or non-retryable errors, call the
-request's error callback, if any, and report via
-`sgn-rpc-error-handler' if set, otherwise just log."
-  (let* ((code (alist-get 'code error-obj))
-         (msg (alist-get 'message error-obj))
-         (method (gethash id sgn-rpc--request-methods))
-         (params (gethash id sgn-rpc--request-params))
-         (callback (gethash id sgn-rpc--pending-callbacks))
-         (error-callback (gethash id sgn-rpc--pending-error-callbacks))
-         (already-retried (gethash id sgn-rpc--retried-ids)))
-    (sgn--log "RPC error [id=%s method=%s code=%s]: %s" id method code msg)
-    ;; Attempt retry for transient errors on idempotent methods.
-    (if (and (sgn-rpc--retryable-error-p code)
-             method
-             (member method sgn-rpc--idempotent-methods)
-             (not already-retried))
-        (progn
-          ;; Mark the original ID as retried so we don't loop.
-          (puthash id t sgn-rpc--retried-ids)
-          ;; Clean up the old request's bookkeeping.
-          (remhash id sgn-rpc--pending-callbacks)
-          (remhash id sgn-rpc--pending-error-callbacks)
-          (remhash id sgn-rpc--request-methods)
-          (remhash id sgn-rpc--request-params)
-          (sgn--log "Scheduling retry for %s (id=%s) in %ds"
-                    method id sgn-rpc--retry-delay)
-          (run-at-time sgn-rpc--retry-delay nil
-                       #'sgn-rpc-send method params callback error-callback))
-      ;; Not retryable: clean up and report.
-      (remhash id sgn-rpc--pending-callbacks)
-      (remhash id sgn-rpc--pending-error-callbacks)
-      (remhash id sgn-rpc--request-methods)
-      (remhash id sgn-rpc--request-params)
-      (remhash id sgn-rpc--retried-ids)
-      (let ((classification
-             (cond
-              ((sgn-rpc--retryable-error-p code) "transient (retry exhausted)")
-              ((memq code sgn-rpc--permanent-error-codes) "permanent")
-              (t "unknown"))))
-        (sgn--log "RPC error classified as %s [code=%s]: %s" classification code msg))
-      (when error-callback
-        (funcall error-callback error-obj))
-      (when sgn-rpc-error-handler
-        (funcall sgn-rpc-error-handler id error-obj)))))
-
-(defun sgn-rpc--handle-result (id result)
-  "Handle a successful JSON-RPC response for request ID with RESULT.
-Invokes and removes the pending callback, if any, then cleans up
-all bookkeeping for this request."
-  (let ((callback (gethash id sgn-rpc--pending-callbacks)))
-    (remhash id sgn-rpc--pending-callbacks)
-    (remhash id sgn-rpc--pending-error-callbacks)
-    (remhash id sgn-rpc--request-methods)
-    (remhash id sgn-rpc--request-params)
-    (remhash id sgn-rpc--retried-ids)
-    (when callback
-      (funcall callback result))))
-
-;;; Addressing helper
-
-(defun sgn-rpc--build-address (chat-id)
-  "Return an alist addressing CHAT-ID for signal-cli RPC methods.
-Phone numbers (starting with \"+\") and UUIDs (containing \"-\")
-are individual recipients and produce (recipient . [CHAT-ID]).
-Everything else is treated as a base64 group ID and produces
-\(groupId . CHAT-ID)."
-  (if (or (string-prefix-p "+" chat-id)
-          (string-match-p "-" chat-id))
-      `((recipient . ,(vector chat-id)))
-    `((groupId . ,chat-id))))
-
-;;; Subscribe receive
-
-(defun sgn-rpc-subscribe-receive (&optional _callback)
-  "No-op for compatibility.
-In jsonRpc mode signal-cli receives messages automatically."
-  nil)
+(defun sgn-rpc-address (chat-id group-p)
+  "Return the RPC parameters addressing CHAT-ID.
+GROUP-P non-nil means CHAT-ID is a base64 group ID; otherwise it
+is a person's ACI or phone number."
+  (if group-p
+      `((groupId . ,chat-id))
+    `((recipient . ,(vector chat-id)))))
 
 ;;; Convenience functions for specific RPC methods
 
-(defun sgn-rpc-send-message (chat-id text &optional extras callback
+(defun sgn-rpc-send-message (address text &optional extras callback
                                      error-callback)
-  "Send TEXT to CHAT-ID.
-EXTRAS is an optional alist of additional parameters (e.g.
-quoteTimestamp, quoteAuthor, editTimestamp, attachments).  If
-CALLBACK is non-nil, it is called with the result, whose
-`timestamp' is the message's Signal timestamp.  If ERROR-CALLBACK
-is non-nil, it is called with the error object if the send fails.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((message . ,text))
-                        extras)))
-    (sgn-rpc-send "send" params callback error-callback)))
+  "Send TEXT to ADDRESS, an alist from `sgn-rpc-address'.
+EXTRAS is an alist of additional `send' parameters, such as
+`quoteTimestamp' or `attachments'.  CALLBACK and ERROR-CALLBACK
+are as in `sgn-rpc-send'.  The result's `timestamp' is the
+message's Signal timestamp.  Return the request ID."
+  (sgn-rpc-send "send"
+                (append address (when text `((message . ,text))) extras)
+                callback error-callback))
 
-(defun sgn-rpc-send-reaction (chat-id emoji target-author target-ts &optional remove)
-  "Send reaction EMOJI to message identified by TARGET-AUTHOR and TARGET-TS.
-CHAT-ID is the conversation.  If REMOVE is non-nil, remove the
-reaction instead of adding it.  Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
+(defun sgn-rpc-send-reaction (address emoji target-author target-ts
+                                      &optional remove callback error-callback)
+  "Send reaction EMOJI to ADDRESS for the message TARGET-AUTHOR sent at TARGET-TS.
+If REMOVE is non-nil, remove the reaction instead.  CALLBACK and
+ERROR-CALLBACK are as in `sgn-rpc-send'."
+  (sgn-rpc-send "sendReaction"
+                (append address
                         `((emoji . ,emoji)
                           (targetAuthor . ,target-author)
                           (targetTimestamp . ,target-ts))
-                        (when remove '((remove . t))))))
-    (sgn-rpc-send "sendReaction" params)))
+                        (when remove '((remove . t))))
+                callback error-callback))
 
-(defun sgn-rpc-send-typing (chat-id &optional stop)
-  "Send typing indicator to CHAT-ID.
-If STOP is non-nil, send a stop-typing notification instead.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        (when stop '((stop . t))))))
-    (sgn-rpc-send "sendTyping" params)))
+(defun sgn-rpc-send-typing (address &optional stop)
+  "Send a typing indicator to ADDRESS; with STOP, a stop indicator.
+Failures are only logged."
+  (sgn-rpc-send "sendTyping" (append address (when stop '((stop . t))))
+                nil #'ignore))
 
 (defun sgn-rpc-send-receipt (recipient timestamps &optional type)
-  "Send receipt for TIMESTAMPS to RECIPIENT.
-TIMESTAMPS is a list of Signal message timestamps (integers).
-TYPE defaults to \"read\"; other valid values are \"viewed\" and
-\"delivered\".  Return the request ID."
-  (let ((params `((recipient . ,recipient)
+  "Send a TYPE receipt for TIMESTAMPS to RECIPIENT.
+TYPE defaults to \"read\".  Failures are only logged."
+  (sgn-rpc-send "sendReceipt"
+                `((recipient . ,recipient)
                   (targetTimestamp . ,(vconcat timestamps))
-                  (type . ,(or type "read")))))
-    (sgn-rpc-send "sendReceipt" params)))
+                  (type . ,(or type "read")))
+                nil #'ignore))
 
-(defun sgn-rpc-remote-delete (chat-id target-ts)
-  "Send a remote delete for the message at TARGET-TS in CHAT-ID.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((targetTimestamp . ,target-ts)))))
-    (sgn-rpc-send "remoteDelete" params)))
+(defun sgn-rpc-remote-delete (address target-ts &optional callback error-callback)
+  "Delete for everyone, in ADDRESS, the message sent at TARGET-TS.
+CALLBACK and ERROR-CALLBACK are as in `sgn-rpc-send'."
+  (sgn-rpc-send "remoteDelete" (append address `((targetTimestamp . ,target-ts)))
+                callback error-callback))
 
-(defun sgn-rpc-send-edit (chat-id text edit-ts &optional extras)
-  "Send edited TEXT for the message at EDIT-TS in CHAT-ID.
-EXTRAS is an optional alist of additional parameters.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((message . ,text)
-                          (editTimestamp . ,edit-ts))
-                        extras)))
-    (sgn-rpc-send "send" params)))
+(defun sgn-rpc-send-pin (address target-author target-ts unpin
+                                 &optional callback error-callback)
+  "Pin, in ADDRESS, the message TARGET-AUTHOR sent at TARGET-TS.
+With UNPIN non-nil, unpin it instead.  CALLBACK and ERROR-CALLBACK
+are as in `sgn-rpc-send'."
+  (sgn-rpc-send (if unpin "sendUnpinMessage" "sendPinMessage")
+                (append address `((targetAuthor . ,target-author)
+                                  (targetTimestamp . ,target-ts)))
+                callback error-callback))
 
-(defun sgn-rpc-list-contacts (&optional callback)
-  "Request the contact list from signal-cli.
-If CALLBACK is non-nil, it is called with the result.
-Return the request ID."
-  (sgn-rpc-send "listContacts" nil callback))
+(defun sgn-rpc-list-contacts (callback)
+  "Request the contact list from signal-cli, passing it to CALLBACK."
+  (sgn-rpc-send "listContacts" nil callback #'ignore))
 
-(defun sgn-rpc-list-groups (&optional callback)
-  "Request the group list from signal-cli.
-If CALLBACK is non-nil, it is called with the result.
-Return the request ID."
-  (sgn-rpc-send "listGroups" nil callback))
-
-(defun sgn-rpc-send-poll-create (chat-id question options)
-  "Create a poll in CHAT-ID with QUESTION and OPTIONS.
-OPTIONS is a list of option strings.  Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((pollQuestion . ,question)
-                          (pollOptions . ,(vconcat options))))))
-    (sgn-rpc-send "sendPollCreate" params)))
-
-(defun sgn-rpc-send-poll-vote (chat-id poll-author poll-ts option-indexes vote-count)
-  "Vote in a poll in CHAT-ID.
-POLL-AUTHOR and POLL-TS identify the poll message.
-OPTION-INDEXES is a list of integers (the selected option indexes).
-VOTE-COUNT is the monotonically increasing vote count for this
-client.  Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((pollAuthor . ,poll-author)
-                          (pollTimestamp . ,poll-ts)
-                          (pollOption . ,(vconcat option-indexes))
-                          (voteCount . ,vote-count)))))
-    (sgn-rpc-send "sendPollVote" params)))
-
-(defun sgn-rpc-send-pin (chat-id target-author target-ts &optional duration)
-  "Pin the message identified by TARGET-AUTHOR and TARGET-TS in CHAT-ID.
-If DURATION is non-nil, it specifies the pin duration in seconds.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((targetAuthor . ,target-author)
-                          (targetTimestamp . ,target-ts))
-                        (when duration
-                          `((pinDuration . ,duration))))))
-    (sgn-rpc-send "sendPinMessage" params)))
-
-(defun sgn-rpc-send-unpin (chat-id target-author target-ts)
-  "Unpin the message identified by TARGET-AUTHOR and TARGET-TS in CHAT-ID.
-Return the request ID."
-  (let ((params (append (sgn-rpc--build-address chat-id)
-                        `((targetAuthor . ,target-author)
-                          (targetTimestamp . ,target-ts)))))
-    (sgn-rpc-send "sendUnpinMessage" params)))
+(defun sgn-rpc-list-groups (callback)
+  "Request the group list from signal-cli, passing it to CALLBACK."
+  (sgn-rpc-send "listGroups" nil callback #'ignore))
 
 (provide 'sgn-rpc)
 ;;; sgn-rpc.el ends here

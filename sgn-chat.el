@@ -9,40 +9,34 @@
 
 ;;; Commentary:
 
-;; Chat buffer mode with telega-style rendering: header + body grouping,
-;; text properties for point-based commands, multi-line input, and draft
-;; persistence.
+;; Chat buffers.  Each chat has at most one buffer, found through a
+;; registry keyed by chat ID; the buffer's name only shows the chat's
+;; display name and follows it when it changes.
+;;
+;; A chat buffer has two parts: the message history, which is
+;; read-only, and below it the prompt and the input area.  The history
+;; is always drawn from the database: whenever the store reports that
+;; a chat changed, its buffer redraws the history, keeping the input,
+;; its undo history, and each window's position.  Messages are drawn
+;; in timestamp order, and only the latest `sgn-chat--limit' of them.
 
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
+(require 'json)
+(require 'sgn-db)
+(require 'sgn-format)
+(require 'sgn-media)
+(require 'sgn-contacts)
 
 (declare-function sgn--log "sgn")
-(declare-function sgn-db-get-messages "sgn-db")
-(declare-function sgn-db-get-chat "sgn-db")
-(declare-function sgn-db-get-latest-incoming "sgn-db")
-(declare-function sgn-db-save-draft "sgn-db")
-(declare-function sgn-db-get-draft "sgn-db")
-(declare-function sgn-db-get-reactions "sgn-db")
-(declare-function sgn-db-get-media "sgn-db")
-(declare-function sgn-db-set-unread "sgn-db")
-(declare-function sgn-db-get-pins "sgn-db")
-(declare-function sgn-rpc-send-typing "sgn-rpc")
-(declare-function sgn-rpc-send-receipt "sgn-rpc")
+(declare-function sgn-mark-chat-read "sgn")
 (declare-function sgn-rpc-alive-p "sgn-rpc")
-(declare-function sgn-contacts-get-name "sgn-contacts")
-(declare-function sgn-contacts-display-sender "sgn-contacts")
-(declare-function sgn-media-insert "sgn-media")
-(declare-function sgn-media-insert-inline-image "sgn-media")
-(declare-function sgn-media-insert-voice-note "sgn-media")
-(declare-function sgn-media-insert-link-preview "sgn-media")
-(declare-function sgn-format-apply-styles "sgn-format")
-(declare-function sgn-notify-update "sgn-notify")
-(declare-function sgn-db-insert-message "sgn-db")
-(declare-function sgn-db-upsert-chat "sgn-db")
-(declare-function sgn-db-update-message "sgn-db")
-(declare-function sgn-db-get-message-by-rowid "sgn-db")
-(declare-function sgn-dashboard-refresh "sgn-dashboard")
+(declare-function sgn-rpc-send-typing "sgn-rpc")
+(declare-function sgn-chat-address "sgn-actions")
+(declare-function sgn-send-text "sgn-actions")
+(declare-function sgn-send-edit "sgn-actions")
 (declare-function sgn-react "sgn-actions")
 (declare-function sgn-reply "sgn-actions")
 (declare-function sgn-edit "sgn-actions")
@@ -50,17 +44,16 @@
 (declare-function sgn-forward "sgn-actions")
 (declare-function sgn-toggle-pin "sgn-actions")
 (declare-function sgn-copy-text "sgn-actions")
-(declare-function sgn-attach-file "sgn")
-(declare-function sgn-send-voice-note "sgn")
+(declare-function sgn-attach-file "sgn-actions")
+(declare-function sgn-search-in-chat "sgn-search")
+(declare-function sgn-store-self-p "sgn-store")
 
-(defvar sgn-account)
-(defvar sgn-send-read-receipts)
 (defvar sgn-send-typing)
 
 ;;;; Customization
 
 (defcustom sgn-history-page-size 50
-  "Number of messages loaded per page."
+  "Number of messages shown at first, and added by each `sgn-load-more-history'."
   :type 'integer
   :group 'sgn)
 
@@ -74,44 +67,15 @@
   :type 'integer
   :group 'sgn)
 
-(defcustom sgn-send-timeout 30
-  "Seconds to wait for signal-cli to confirm a sent message.
-A message still unconfirmed after this long is marked as such in
-the chat buffer.  It is marked as sent if confirmation arrives
-later."
-  :type 'integer
-  :group 'sgn)
-
-(defconst sgn-chat--send-status-labels
-  '(("sending" "sending…" sgn-timestamp-face)
-    ("unconfirmed" "not confirmed: may not have been sent" sgn-error-face)
-    ("failed" "not sent" sgn-error-face)
-    ("partial" "not delivered to every recipient" sgn-error-face))
-  "Labels shown after sent messages, by send status.
-Each entry is (STATUS LABEL FACE).  Messages whose status is not
-listed, such as confirmed or received ones, show no label.")
-
 (defcustom sgn-timestamp-format 'smart
   "How to format message timestamps.
-`smart' uses relative for recent, absolute for older.
-`absolute' always shows full date/time.
-`relative' always shows relative time."
+`smart' shows the time for today, the weekday for this week, and
+the date for older messages.  `absolute' always shows the date."
   :type '(choice (const :tag "Smart" smart)
-                 (const :tag "Absolute" absolute)
-                 (const :tag "Relative" relative))
+                 (const :tag "Absolute" absolute))
   :group 'sgn)
 
 ;;;; Faces
-
-(defface sgn-my-msg-face
-  '((t :inherit font-lock-function-name-face))
-  "Face for your own messages."
-  :group 'sgn)
-
-(defface sgn-other-msg-face
-  '((t :inherit font-lock-variable-name-face))
-  "Face for other people's messages."
-  :group 'sgn)
 
 (defface sgn-header-face
   '((t :inherit bold))
@@ -120,7 +84,7 @@ listed, such as confirmed or received ones, show no label.")
 
 (defface sgn-timestamp-face
   '((t :inherit shadow))
-  "Face for timestamps."
+  "Face for timestamps and minor annotations."
   :group 'sgn)
 
 (defface sgn-deleted-face
@@ -130,12 +94,12 @@ listed, such as confirmed or received ones, show no label.")
 
 (defface sgn-error-face
   '((t :inherit error))
-  "Face for error messages."
+  "Face for messages that were not sent."
   :group 'sgn)
 
 (defface sgn-receipt-face
   '((t :inherit shadow))
-  "Face for delivery status checkmarks."
+  "Face for delivery and read marks."
   :group 'sgn)
 
 (defface sgn-quote-face
@@ -146,373 +110,566 @@ listed, such as confirmed or received ones, show no label.")
 ;;;; Buffer-local state
 
 (defvar-local sgn-chat-id nil
-  "The Signal chat ID for this buffer (phone number or group ID).")
-
-(defvar-local sgn-chat--input-marker nil
-  "Marker at the start of the editable input area.")
+  "The chat ID of this buffer.")
 
 (defvar-local sgn-chat--prompt-start nil
-  "Marker at the very start of the prompt line (before the prompt string).")
+  "Marker at the start of the prompt.")
 
-(defvar-local sgn-chat--last-sender nil
-  "Sender of the most recently rendered message, for grouping.")
+(defvar-local sgn-chat--input-marker nil
+  "Marker at the start of the input area.")
 
-(defvar-local sgn-chat--last-timestamp nil
-  "Timestamp (ms) of the most recently rendered message, for grouping.")
+(defvar-local sgn-chat--limit nil
+  "Number of latest messages shown.")
 
 (defvar-local sgn-chat--reply-target nil
-  "Plist of the message being replied to, or nil.
-Keys: :timestamp :sender :body")
+  "The message being replied to, as a message plist, or nil.")
+
+(defvar-local sgn-chat--stashed-input nil
+  "Input set aside while an edit is composed, or nil.")
 
 (defvar-local sgn-chat--edit-target nil
-  "Plist of the message being edited, or nil.
-Keys: :timestamp :rowid :body")
+  "The message being edited, as a message plist, or nil.")
 
-(defvar-local sgn-chat--typing-timer nil
-  "Timer for sending typing stop indicator.")
+(defvar-local sgn-chat--revealed nil
+  "List of rowids of messages whose spoilers are revealed.")
+
+(defvar-local sgn-chat--redraw-timer nil
+  "Timer for a pending redraw, or nil.")
+
+(defvar-local sgn-chat--typists nil
+  "Alist of (SENDER . TIMER) for people shown as typing.")
 
 (defvar-local sgn-chat--typing-sent-at nil
-  "Time the last typing start indicator was sent, or nil when idle.")
+  "Time the last typing indicator was sent, or nil when not typing.")
+
+(defvar-local sgn-chat--typing-stop-timer nil
+  "Timer that sends the typing stop indicator.")
+
+(defvar-local sgn-chat--draft-timer nil
+  "Timer that saves the input as a draft.")
+
+(defvar sgn-chat--programmatic nil
+  "Non-nil while sgn itself changes the input, which is not typing.")
 
 (defconst sgn-chat--typing-refresh-interval 10
-  "Seconds between typing start indicators while typing continues.
-Recipients drop the indicator after about 15 seconds without one.")
+  "Seconds between typing indicators sent while typing continues.")
 
-(defvar-local sgn-chat--typing-indicator nil
-  "String currently shown as typing indicator, or nil.")
+(defconst sgn-chat--typing-display-timeout 15
+  "Seconds a typing indicator is shown without being renewed.")
 
-(defvar-local sgn-chat--oldest-timestamp nil
-  "Timestamp of the oldest loaded message, for pagination.")
+;;;; Buffer registry
 
-(defvar-local sgn-chat--all-loaded nil
-  "Non-nil when all history has been loaded (no more older messages).")
+(defvar sgn-chat--buffers (make-hash-table :test 'equal)
+  "Map from chat ID to its live chat buffer.")
 
-;;;; Keymap
+(defun sgn-chat-buffer (chat-id)
+  "Return the live buffer of CHAT-ID, or nil."
+  (let ((buf (gethash chat-id sgn-chat--buffers)))
+    (if (buffer-live-p buf)
+        buf
+      (remhash chat-id sgn-chat--buffers)
+      nil)))
 
-(defvar sgn-chat-mode-map nil
+(defun sgn-chat--buffer-name (chat-id)
+  "Return the name a buffer for CHAT-ID should have."
+  (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))
+
+(defun sgn-chat-get-buffer (chat-id)
+  "Return the buffer of CHAT-ID, creating it if needed."
+  (or (sgn-chat-buffer chat-id)
+      (let ((buf (generate-new-buffer (sgn-chat--buffer-name chat-id))))
+        (puthash chat-id buf sgn-chat--buffers)
+        (with-current-buffer buf
+          (sgn-chat-mode)
+          (setq sgn-chat-id chat-id)
+          (sgn-chat--draw-prompt)
+          (sgn-chat--restore-draft)
+          (sgn-chat--redraw)
+          (goto-char (point-max)))
+        buf)))
+
+(defun sgn-chat-open (chat-id)
+  "Show the chat CHAT-ID in the selected window."
+  (sgn-db-ensure-chat chat-id (or (sgn-db-chat-type chat-id) "individual"))
+  (switch-to-buffer (sgn-chat-get-buffer chat-id)))
+
+(defun sgn-chat--unregister ()
+  "Remove the current buffer from the registry."
+  (when (eq (gethash sgn-chat-id sgn-chat--buffers) (current-buffer))
+    (remhash sgn-chat-id sgn-chat--buffers)))
+
+(defun sgn-chat-on-identity-merged (number uuid)
+  "Move the buffer of chat NUMBER to chat UUID, which it was merged into.
+If UUID already has a buffer, the NUMBER buffer's input moves there
+when that buffer has none, and the NUMBER buffer is killed."
+  (when-let* ((buf (sgn-chat-buffer number)))
+    (remhash number sgn-chat--buffers)
+    (if-let* ((other (sgn-chat-buffer uuid)))
+        (let ((input (with-current-buffer buf (sgn-chat--input-text))))
+          (with-current-buffer other
+            (when (and (string-empty-p (sgn-chat--input-text))
+                       (not (string-empty-p input)))
+              (sgn-chat--set-input input)))
+          (with-current-buffer buf
+            (setq sgn-chat-id nil))
+          (let ((kill-buffer-query-functions nil))
+            (kill-buffer buf)))
+      (puthash uuid buf sgn-chat--buffers)
+      (with-current-buffer buf
+        (setq sgn-chat-id uuid))
+      (sgn-chat-schedule-redraw uuid))))
+
+(defun sgn-chat-buffers ()
+  "Return the live chat buffers."
+  (cl-loop for buf being the hash-values of sgn-chat--buffers
+           when (buffer-live-p buf) collect buf))
+
+;;;; Keymaps
+
+(defvar sgn-chat-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'sgn-chat-return)
+    (define-key map (kbd "S-<return>") #'newline)
+    (define-key map (kbd "C-j") #'newline)
+    (define-key map (kbd "C-c C-a") #'sgn-attach-file)
+    (define-key map (kbd "C-c C-s") #'sgn-search-in-chat)
+    (define-key map (kbd "C-c C-l") #'sgn-load-more-history)
+    (define-key map (kbd "C-g") #'sgn-chat-cancel-action)
+    map)
   "Keymap for `sgn-chat-mode'.")
 
-(setq sgn-chat-mode-map
-      (let ((map (make-sparse-keymap)))
-        (define-key map (kbd "RET") #'sgn-chat-send-input)
-        (define-key map (kbd "S-<return>") #'newline)
-        (define-key map (kbd "C-j") #'newline)
-        (define-key map (kbd "C-c C-a") #'sgn-attach-file)
-        (define-key map (kbd "C-c C-v") #'sgn-send-voice-note)
-        (define-key map (kbd "C-g") #'sgn-chat-cancel-action)
-        map))
-
-(defvar sgn-chat-message-map nil
-  "Keymap active on rendered messages, via the `keymap' text property.
-Single-key commands live here rather than in `sgn-chat-mode-map' so
-that they do not shadow `self-insert-command' in the input area.")
-
-(setq sgn-chat-message-map
-      (let ((map (make-sparse-keymap)))
-        (define-key map (kbd "r") #'sgn-reply)
-        (define-key map (kbd "R") #'sgn-react)
-        (define-key map (kbd "e") #'sgn-edit)
-        (define-key map (kbd "d") #'sgn-delete)
-        (define-key map (kbd "f") #'sgn-forward)
-        (define-key map (kbd "P") #'sgn-toggle-pin)
-        (define-key map (kbd "c") #'sgn-copy-text)
-        (define-key map (kbd "g") #'sgn-load-more-history)
-        map))
+(defvar sgn-chat-message-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "r") #'sgn-reply)
+    (define-key map (kbd "R") #'sgn-react)
+    (define-key map (kbd "e") #'sgn-edit)
+    (define-key map (kbd "d") #'sgn-delete)
+    (define-key map (kbd "f") #'sgn-forward)
+    (define-key map (kbd "P") #'sgn-toggle-pin)
+    (define-key map (kbd "c") #'sgn-copy-text)
+    (define-key map (kbd "g") #'sgn-load-more-history)
+    map)
+  "Keymap active on messages, through the `keymap' text property.
+Single-key commands live here rather than in `sgn-chat-mode-map',
+so that they do not shadow typing in the input area.")
 
 ;;;; Major mode
 
 (define-derived-mode sgn-chat-mode fundamental-mode "sgn Chat"
-  "Major mode for Signal chat buffers."
-  (setq-local sgn-chat--input-marker (make-marker))
+  "Major mode for Signal chat buffers.
+
+\\{sgn-chat-mode-map}
+On a message:
+\\{sgn-chat-message-map}"
   (setq-local sgn-chat--prompt-start (make-marker))
-  ;; Text inserted at the prompt start (history, new messages) goes
-  ;; above the prompt, so the marker must advance past it.
-  (set-marker-insertion-type sgn-chat--prompt-start t)
+  (setq-local sgn-chat--input-marker (make-marker))
+  (setq-local sgn-chat--limit sgn-history-page-size)
   (visual-line-mode 1)
   (add-hook 'after-change-functions #'sgn-chat--on-input-change nil t)
-  ;; A chat counts as read once it is shown in the selected window of
-  ;; a focused frame, however it got there.
-  (add-hook 'window-selection-change-functions #'sgn-chat--mark-selected-read)
-  (add-hook 'window-buffer-change-functions #'sgn-chat--mark-selected-read)
-  (add-function :after after-focus-change-function
-                #'sgn-chat--mark-selected-read)
   (add-hook 'kill-buffer-hook #'sgn-chat--on-kill nil t))
 
-;;;; Buffer lifecycle
+;;;; Redrawing
 
-(defun sgn-chat-get-buffer (chat-id)
-  "Get or create the chat buffer for CHAT-ID."
-  (let* ((display-name (sgn-contacts-get-name chat-id))
-         (buf-name (format "*sgn: %s*" display-name))
-         (buffer (get-buffer buf-name)))
-    ;; Check for name collision with a different chat
-    (when (and buffer
-               (not (equal (buffer-local-value 'sgn-chat-id buffer) chat-id)))
-      ;; Disambiguate
-      (let ((suffix (if (string-prefix-p "+" chat-id)
-                        chat-id
-                      (substring chat-id 0 (min 8 (length chat-id))))))
-        (setq buf-name (format "*sgn: %s <%s>*" display-name suffix))
-        (setq buffer (get-buffer buf-name))))
-    (unless buffer
-      (setq buffer (get-buffer-create buf-name))
-      (with-current-buffer buffer
-        (sgn-chat-mode)
-        (setq sgn-chat-id chat-id)
-        (sgn-chat--draw-prompt)
-        (sgn-chat--load-history)
-        (sgn-chat--restore-draft)))
-    buffer))
+(defun sgn-chat-schedule-redraw (chat-id)
+  "Redraw the buffer of CHAT-ID, if any, once the current command is done."
+  (when-let* ((buf (sgn-chat-buffer chat-id)))
+    (with-current-buffer buf
+      (unless (timerp sgn-chat--redraw-timer)
+        (setq sgn-chat--redraw-timer
+              (run-at-time 0 nil #'sgn-chat--redraw-buffer buf))))))
 
-(defun sgn-chat-open (chat-id)
-  "Open the chat buffer for CHAT-ID and switch to it."
-  (let ((buf (sgn-chat-get-buffer chat-id)))
-    (switch-to-buffer buf)
-    (goto-char (point-max))
-    (sgn-chat--mark-read)))
+(defun sgn-chat--redraw-buffer (buffer)
+  "Redraw BUFFER if it is live and the database is open."
+  (when (and (buffer-live-p buffer) sgn-db--connection)
+    (with-current-buffer buffer
+      (sgn-chat--redraw))))
 
-(defun sgn-chat--mark-read ()
-  "Mark the current chat as read and send read receipts if enabled.
-Receipts cover the chat's unread messages, grouped by sender.
-signal-cli also syncs them to this account's other devices."
-  (when-let* ((sgn-chat-id)
-              (unread (plist-get (sgn-db-get-chat sgn-chat-id) :unread))
-              ((> unread 0)))
-    (when (and sgn-send-read-receipts (sgn-rpc-alive-p))
-      (let ((by-sender nil))
-        (pcase-dolist (`(,sender ,ts)
-                       (sgn-db-get-latest-incoming sgn-chat-id sgn-account unread))
-          (push ts (alist-get sender by-sender nil nil #'equal)))
-        (pcase-dolist (`(,sender . ,timestamps) by-sender)
-          (sgn-rpc-send-receipt sender timestamps))))
-    (sgn-db-set-unread sgn-chat-id 0)
-    (sgn-notify-update)
-    (sgn-dashboard-refresh)))
+(defun sgn-chat-on-store-changed (chat-ids)
+  "Redraw the buffers of CHAT-IDS, as `sgn-store-changed-functions' asks."
+  (dolist (chat-id chat-ids)
+    (sgn-chat-schedule-redraw chat-id)))
 
-(defun sgn-chat--mark-selected-read (&rest _)
-  "Mark the chat in the selected window read if its frame has focus."
-  (let ((buf (window-buffer (selected-window))))
-    (when (and (eq (buffer-local-value 'major-mode buf) 'sgn-chat-mode)
-               (frame-focus-state))
-      (with-current-buffer buf
-        (sgn-chat--mark-read)))))
+(defun sgn-chat--redraw ()
+  "Draw the current buffer's history again from the database.
+Each window keeps showing the same message, point stays on the
+same message or input position, and the input is untouched."
+  (when (timerp sgn-chat--redraw-timer)
+    (cancel-timer sgn-chat--redraw-timer))
+  (setq sgn-chat--redraw-timer nil)
+  (sgn-chat--update-buffer-name)
+  (let* ((anchors (sgn-chat--save-positions))
+         (old-end (marker-position sgn-chat--prompt-start))
+         (messages (sgn-db-get-messages sgn-chat-id sgn-chat--limit)))
+    (let ((inhibit-read-only t)
+          (buffer-undo-list t))
+      (save-excursion
+        (delete-region (point-min) sgn-chat--prompt-start)
+        (goto-char (point-min))
+        ;; History goes before the prompt, which must move past it.
+        ;; The marker does so only here: otherwise text typed at the
+        ;; prompt start, as with an empty prompt, would join the
+        ;; history.
+        (set-marker-insertion-type sgn-chat--prompt-start t)
+        (unwind-protect
+            (sgn-chat--insert-history messages)
+          (set-marker-insertion-type sgn-chat--prompt-start nil))
+        (when (> (point) (point-min))
+          (add-text-properties (point-min) (point)
+                               '(read-only t front-sticky (read-only)
+                                           rear-nonsticky (read-only))))))
+    (sgn-chat--fix-input-marker)
+    (sgn-chat--shift-undo (- sgn-chat--prompt-start old-end))
+    (sgn-chat--restore-positions anchors)
+    (setq header-line-format (sgn-chat--header-line))))
 
-;;;; Prompt management
+(defun sgn-chat--update-buffer-name ()
+  "Rename the buffer if the chat's display name changed."
+  (let ((name (sgn-chat--buffer-name sgn-chat-id)))
+    ;; `rename-buffer' may have made the name unique with a <N> suffix.
+    (unless (string-match-p (concat "\\`" (regexp-quote name) "\\(?:<[0-9]+>\\)?\\'")
+                            (buffer-name))
+      (rename-buffer name t))))
 
-(defun sgn-chat--draw-prompt ()
-  "Draw the input prompt and update markers."
-  (let ((inhibit-read-only t))
-    (goto-char (point-max))
-    (let ((start (point))
-          (prompt-text (sgn-chat--build-prompt-text)))
-      (insert (propertize prompt-text
-                          'read-only t
-                          'face 'minibuffer-prompt
-                          'rear-nonsticky '(read-only face)
-                          'front-sticky '(read-only face)))
-      ;; Set after inserting: the marker advances over insertions.
-      (set-marker sgn-chat--prompt-start start))
-    (set-marker sgn-chat--input-marker (point))))
+(defun sgn-chat--fix-input-marker ()
+  "Put the input marker right after the prompt.
+With an empty prompt the two markers coincide, and inserting the
+history would otherwise leave the input marker before it."
+  (set-marker sgn-chat--input-marker
+              (max sgn-chat--input-marker
+                   (+ sgn-chat--prompt-start
+                      (length (sgn-chat--prompt-text))))))
 
-(defun sgn-chat--build-prompt-text ()
-  "Build the prompt text, including reply/edit context if active."
+(defun sgn-chat--shift-undo (delta)
+  "Shift buffer positions in `buffer-undo-list' by DELTA.
+Undo entries only concern the input, which redrawing the history
+moved by DELTA."
+  (unless (or (zerop delta) (eq buffer-undo-list t))
+    (setq buffer-undo-list
+          (mapcar (lambda (entry) (sgn-chat--shift-undo-entry entry delta))
+                  buffer-undo-list))))
+
+(defun sgn-chat--shift-undo-entry (entry delta)
+  "Return the undo ENTRY with its buffer positions shifted by DELTA."
+  (pcase entry
+    ((pred integerp) (+ entry delta))
+    (`(,(and beg (pred integerp)) . ,(and end (pred integerp)))
+     (cons (+ beg delta) (+ end delta)))
+    (`(,(and text (pred stringp)) . ,(and pos (pred integerp)))
+     (cons text (if (< pos 0) (- pos delta) (+ pos delta))))
+    (`(nil ,prop ,val ,beg . ,end)
+     (cl-list* nil prop val (+ beg delta) (+ end delta)))
+    (_ entry)))
+
+(defun sgn-chat--save-positions ()
+  "Return the positions of point and window starts, relative to messages."
+  (cons (cons nil (sgn-chat--anchor (point)))
+        (mapcar (lambda (win)
+                  (list win (sgn-chat--anchor (window-start win))
+                        (sgn-chat--anchor (window-point win))))
+                (get-buffer-window-list nil nil t))))
+
+(defun sgn-chat--anchor (pos)
+  "Return POS as an anchor that survives a redraw."
+  (cond
+   ((>= pos sgn-chat--prompt-start)
+    (list 'prompt (- pos sgn-chat--prompt-start)))
+   ((get-text-property pos 'sgn-message-rowid)
+    (let ((start (or (previous-single-property-change
+                      (1+ pos) 'sgn-message-rowid)
+                     (point-min))))
+      (list 'message (get-text-property pos 'sgn-message-rowid)
+            (- pos start))))
+   (t (list 'top pos))))
+
+(defun sgn-chat--resolve-anchor (anchor)
+  "Return the buffer position ANCHOR stands for after a redraw."
+  (pcase anchor
+    (`(prompt ,offset) (min (point-max) (+ sgn-chat--prompt-start offset)))
+    (`(message ,rowid ,offset)
+     (if-let* ((match (save-excursion
+                        (goto-char (point-min))
+                        (text-property-search-forward 'sgn-message-rowid rowid t))))
+         (min (+ (prop-match-beginning match) offset)
+              (1- (prop-match-end match)))
+       (point-min)))
+    (`(top ,pos) (min pos sgn-chat--prompt-start))))
+
+(defun sgn-chat--restore-positions (anchors)
+  "Restore point and window positions from ANCHORS."
+  (goto-char (sgn-chat--resolve-anchor (cdr (car anchors))))
+  (pcase-dolist (`(,win ,start ,point) (cdr anchors))
+    (when (window-live-p win)
+      (set-window-start win (sgn-chat--resolve-anchor start) t)
+      (set-window-point win (sgn-chat--resolve-anchor point)))))
+
+;;;; Rendering messages
+
+(defun sgn-chat--insert-history (messages)
+  "Insert MESSAGES, grouped under headers by sender and time."
+  (let ((last-sender nil) (last-ts nil))
+    (dolist (msg messages)
+      (let ((sender (plist-get msg :sender))
+            (ts (plist-get msg :timestamp))
+            (start (point)))
+        (unless (and (equal sender last-sender) last-ts
+                     (< (- ts last-ts) (* 1000 sgn-message-grouping-interval)))
+          (sgn-chat--insert-header sender ts))
+        (sgn-chat--insert-message msg)
+        (add-text-properties start (point)
+                             (list 'sgn-message-rowid (plist-get msg :rowid)
+                                   'keymap sgn-chat-message-map))
+        (setq last-sender sender last-ts ts)))))
+
+(defun sgn-chat--insert-header (sender timestamp)
+  "Insert a header for messages from SENDER starting at TIMESTAMP."
+  (let* ((label (format "── %s · %s " (sgn-contacts-display-sender sender)
+                        (sgn-chat--format-timestamp timestamp)))
+         (width (if-let* ((win (get-buffer-window nil t)))
+                    (window-body-width win)
+                  80))
+         (fill (max 0 (- width (string-width label) 1))))
+    (insert (propertize (concat label (make-string fill ?─) "\n")
+                        'face 'sgn-header-face))))
+
+(defun sgn-chat--insert-message (msg)
+  "Insert the quote, body, media, reactions and pin mark of MSG."
+  (let ((rowid (plist-get msg :rowid)))
+    (when (plist-get msg :quote-ts)
+      (sgn-chat--insert-quote (plist-get msg :quote-author)
+                              (plist-get msg :quote-body)))
+    (if (eql (plist-get msg :deleted) 1)
+        (insert (propertize "  [Message deleted]" 'face 'sgn-deleted-face)
+                "\n")
+      (when-let* ((body (plist-get msg :body)))
+        (unless (string-empty-p body)
+          (insert "  " (sgn-format-render
+                        body
+                        (sgn-format-read-ranges (plist-get msg :styles-json))
+                        (sgn-format-read-ranges (plist-get msg :mentions-json))
+                        (memq rowid sgn-chat--revealed)))
+          (sgn-chat--insert-annotations msg)
+          (insert "\n")))
+      (dolist (media (sgn-db-get-media rowid))
+        (sgn-media-render media))
+      (unless (plist-get msg :body)
+        (when (sgn-chat--annotations msg)
+          (insert " ")
+          (sgn-chat--insert-annotations msg)
+          (insert "\n"))))
+    (sgn-chat--insert-reactions msg)
+    (when (sgn-db-pinned-p sgn-chat-id (plist-get msg :sender)
+                           (plist-get msg :timestamp))
+      (insert "  📌\n"))))
+
+(defun sgn-chat--insert-quote (author body)
+  "Insert a quote block for the message AUTHOR wrote, BODY."
+  (let* ((text (replace-regexp-in-string "\n" " " (or body "")))
+         (preview (truncate-string-to-width text 60 nil nil "…")))
+    (insert (propertize (format "  ┃ %s: %s\n"
+                                (if author (sgn-contacts-display-sender author) "?")
+                                preview)
+                        'face 'sgn-quote-face))))
+
+(defconst sgn-chat--send-status-labels
+  '(("sending" "sending…" sgn-timestamp-face)
+    ("unconfirmed" "not confirmed: may not have been sent" sgn-error-face)
+    ("failed" "not sent" sgn-error-face)
+    ("partial" "not delivered to every recipient" sgn-error-face))
+  "Labels shown after sent messages, by send status.
+Each entry is (STATUS LABEL FACE).  Messages whose status is not
+listed, such as delivered or received ones, show no label.")
+
+(defconst sgn-chat--edit-status-labels
+  '(("sending" "saving edit…" sgn-timestamp-face)
+    ("unconfirmed" "edit not confirmed" sgn-error-face)
+    ("partial" "edit not delivered to every recipient" sgn-error-face))
+  "Labels shown after edited messages, by the status of the latest edit.")
+
+(defun sgn-chat--annotations (msg)
+  "Return the annotations to show after MSG's text, as propertized strings."
+  (delq nil
+        (list
+         (when (plist-get msg :edited-at)
+           (propertize "(edited)" 'face 'sgn-timestamp-face))
+         (when-let* ((entry (assoc (plist-get msg :send-status)
+                                   sgn-chat--send-status-labels)))
+           (propertize (format "(%s)" (nth 1 entry)) 'face (nth 2 entry)))
+         (when-let* ((entry (assoc (plist-get msg :edit-status)
+                                   sgn-chat--edit-status-labels)))
+           (propertize (format "(%s)" (nth 1 entry)) 'face (nth 2 entry)))
+         (when (and (eql (plist-get msg :outgoing) 1)
+                    (member (plist-get msg :send-status) '(nil "sent")))
+           (sgn-chat--receipt-mark (plist-get msg :timestamp))))))
+
+(defun sgn-chat--insert-annotations (msg)
+  "Insert MSG's annotations, each preceded by a space."
+  (dolist (annotation (sgn-chat--annotations msg))
+    (insert " " annotation)))
+
+(defun sgn-chat--receipt-mark (timestamp)
+  "Return the delivery mark for our message sent at TIMESTAMP, or nil."
+  (let ((types (sgn-db-receipt-types timestamp)))
+    (cond
+     ((or (member "read" types) (member "viewed" types))
+      (propertize "✓✓" 'face 'sgn-receipt-face 'help-echo "Read"))
+     ((member "delivered" types)
+      (propertize "✓" 'face 'sgn-receipt-face 'help-echo "Delivered")))))
+
+(defun sgn-chat--insert-reactions (msg)
+  "Insert the reactions to MSG on one line, if any."
+  (when-let* ((reactions (sgn-db-get-reactions sgn-chat-id
+                                               (plist-get msg :sender)
+                                               (plist-get msg :timestamp))))
+    (let ((groups nil))
+      (pcase-dolist (`(,sender ,emoji) reactions)
+        (push (sgn-contacts-display-sender sender)
+              (alist-get emoji groups nil nil #'equal)))
+      (insert "  "
+              (mapconcat (pcase-lambda (`(,emoji . ,senders))
+                           (format "%s %s" emoji
+                                   (string-join (nreverse senders) ", ")))
+                         (nreverse groups) "  ")
+              "\n"))))
+
+(defun sgn-chat--format-timestamp (timestamp-ms)
+  "Format TIMESTAMP-MS according to `sgn-timestamp-format'."
+  (if (eq sgn-timestamp-format 'absolute)
+      (format-time-string "%b %d, %H:%M" (/ timestamp-ms 1000.0))
+    (sgn-contacts-format-time timestamp-ms t)))
+
+(defun sgn-chat-format-duration (seconds)
+  "Format SECONDS as a short duration, such as \"5m\" or \"7d\"."
+  (cond
+   ((< seconds 60) (format "%ds" seconds))
+   ((< seconds 3600) (format "%dm" (/ seconds 60)))
+   ((< seconds 86400) (format "%dh" (/ seconds 3600)))
+   ((< seconds 604800) (format "%dd" (/ seconds 86400)))
+   (t (format "%dw" (/ seconds 604800)))))
+
+(defun sgn-chat--header-line ()
+  "Return the header line: the chat's name, timer, and who is typing."
+  (let ((expiration (or (plist-get (sgn-db-get-chat sgn-chat-id) :expiration) 0))
+        (typists (mapcar (lambda (entry) (sgn-contacts-display-sender (car entry)))
+                         sgn-chat--typists)))
+    (concat (sgn-contacts-get-name sgn-chat-id)
+            (when (> expiration 0)
+              (format " ⏱ %s" (sgn-chat-format-duration expiration)))
+            (when typists
+              (format " — %s %s typing…" (string-join typists ", ")
+                      (if (cdr typists) "are" "is"))))))
+
+;;;; Prompt and input
+
+(defun sgn-chat--prompt-text ()
+  "Return the prompt, including the reply or edit being composed."
   (cond
    (sgn-chat--reply-target
-    (let* ((sender (sgn-contacts-display-sender
-                    (plist-get sgn-chat--reply-target :sender)))
-           (body (or (plist-get sgn-chat--reply-target :body) ""))
-           (preview (if (> (length body) 40)
-                        (concat (substring body 0 40) "…")
-                      body)))
-      (format "┃ Replying to %s: %s\n%s" sender preview sgn-prompt)))
+    (format "┃ Replying to %s: %s\n%s"
+            (sgn-contacts-display-sender (plist-get sgn-chat--reply-target :sender))
+            (truncate-string-to-width
+             (replace-regexp-in-string
+              "\n" " " (or (plist-get sgn-chat--reply-target :body) ""))
+             40 nil nil "…")
+            sgn-prompt))
    (sgn-chat--edit-target
-    (format "┃ Editing message\n%s" sgn-prompt))
-   (t
-    sgn-prompt)))
+    (format "┃ Editing message (C-g to cancel)\n%s" sgn-prompt))
+   (t sgn-prompt)))
+
+(defun sgn-chat--draw-prompt ()
+  "Draw the prompt at the end of the buffer and set the markers."
+  (let ((inhibit-read-only t)
+        (sgn-chat--programmatic t))
+    (save-excursion
+      (goto-char (point-max))
+      (let ((start (point)))
+        (insert (propertize (sgn-chat--prompt-text)
+                            'read-only t 'face 'minibuffer-prompt
+                            'front-sticky '(read-only)
+                            'rear-nonsticky t))
+        (set-marker sgn-chat--prompt-start start)
+        (set-marker sgn-chat--input-marker (point))))))
 
 (defun sgn-chat--redraw-prompt ()
-  "Redraw the prompt (e.g., after reply/edit state changes)."
-  (let ((inhibit-read-only t)
-        (input-text (sgn-chat--get-input-text)))
-    ;; Remove old prompt + input
-    (delete-region (marker-position sgn-chat--prompt-start) (point-max))
-    ;; Redraw
-    (sgn-chat--draw-prompt)
-    ;; Restore input
-    (goto-char (point-max))
-    (insert input-text)))
+  "Redraw the prompt, keeping the input and point's place in it."
+  (let ((input (sgn-chat--input-text))
+        (offset (and (>= (point) sgn-chat--prompt-start)
+                     (max 0 (- (point) sgn-chat--input-marker))))
+        (sgn-chat--programmatic t)
+        (inhibit-read-only t))
+    (save-excursion
+      (delete-region sgn-chat--prompt-start (point-max))
+      (sgn-chat--draw-prompt)
+      (goto-char (point-max))
+      (insert input))
+    (when offset
+      (goto-char (min (point-max) (+ sgn-chat--input-marker offset))))))
 
-;;;; Cursor guard — no-op
-;; The message area is protected by `read-only' text properties
-;; (set when messages are rendered).  The cursor moves freely so
-;; that point-based commands (react, reply, etc.) work naturally.
+(defun sgn-chat--input-text ()
+  "Return the text in the input area."
+  (buffer-substring-no-properties sgn-chat--input-marker (point-max)))
 
-;;;; Input handling
+(defun sgn-chat--set-input (text)
+  "Replace the input with TEXT."
+  (let ((sgn-chat--programmatic t)
+        (inhibit-read-only t))
+    (delete-region sgn-chat--input-marker (point-max))
+    (save-excursion
+      (goto-char (point-max))
+      (insert text))))
 
-(defun sgn-chat--get-input-text ()
-  "Return the current input text (after the prompt)."
-  (if (and sgn-chat--input-marker
-           (marker-position sgn-chat--input-marker))
-      (buffer-substring-no-properties
-       (marker-position sgn-chat--input-marker)
-       (point-max))
-    ""))
+(defun sgn-chat-return ()
+  "Send the input, or act on the message at point.
+In the history, open the media, link or spoiler at point."
+  (interactive)
+  (if (>= (point) sgn-chat--input-marker)
+      (sgn-chat-send-input)
+    (sgn-open-at-point)))
 
 (defun sgn-chat-send-input ()
-  "Send the input text to the current chat."
+  "Send the input to the chat, as a reply or edit if one is being composed.
+The input is cleared only once the message has been handed over."
   (interactive)
-  (let ((text (string-trim (sgn-chat--get-input-text))))
-    (when (string-empty-p text)
+  (let ((text (string-trim-right (sgn-chat--input-text))))
+    (when (string-blank-p text)
       (user-error "Nothing to send"))
-    ;; Clear input area
-    (let ((inhibit-read-only t))
-      (delete-region (marker-position sgn-chat--input-marker) (point-max)))
-    ;; Determine what to send
-    (cond
-     (sgn-chat--edit-target
-      ;; Editing a message
-      (let ((edit-ts (plist-get sgn-chat--edit-target :timestamp)))
-        (sgn-chat--do-send-edit sgn-chat-id text edit-ts)
-        (setq sgn-chat--edit-target nil)
-        (sgn-chat--redraw-prompt)))
-     (sgn-chat--reply-target
-      ;; Replying to a message
-      (let ((quote-ts (plist-get sgn-chat--reply-target :timestamp))
-            (quote-author (plist-get sgn-chat--reply-target :sender))
-            (quote-body (plist-get sgn-chat--reply-target :body)))
-        (sgn-chat--do-send-reply sgn-chat-id text quote-ts quote-author quote-body)
-        (setq sgn-chat--reply-target nil)
-        (sgn-chat--redraw-prompt)))
-     (t
-      ;; Normal message
-      (sgn-chat--do-send sgn-chat-id text)))
-    ;; Stop typing indicator
-    (sgn-chat--stop-typing)))
+    (if sgn-chat--edit-target
+        (sgn-send-edit sgn-chat--edit-target text)
+      (sgn-send-text sgn-chat-id text sgn-chat--reply-target))
+    (let ((editing sgn-chat--edit-target))
+      (setq sgn-chat--reply-target nil
+            sgn-chat--edit-target nil)
+      (sgn-chat--set-input (if editing (sgn-chat--take-stash) ""))
+      (sgn-chat--redraw-prompt)
+      (unless editing
+        (sgn-chat--stop-typing)
+        (sgn-db-save-draft sgn-chat-id nil)))
+    (goto-char (point-max))))
 
-(declare-function sgn-rpc-send-message "sgn-rpc")
-(declare-function sgn-rpc-send-edit "sgn-rpc")
-(declare-function sgn-format-parse-markup "sgn-format")
-(declare-function sgn-format-styles-to-json "sgn-format")
+(defun sgn-chat--take-stash ()
+  "Return the input set aside for an edit, and forget it."
+  (prog1 (or sgn-chat--stashed-input "")
+    (setq sgn-chat--stashed-input nil)))
 
-(defun sgn-chat--do-send (chat-id text)
-  "Send plain TEXT to CHAT-ID, with markup parsing."
-  (let* ((parsed (sgn-format-parse-markup text))
-         (plain (plist-get parsed :text))
-         (styles (plist-get parsed :styles))
-         (styles-json (when styles (sgn-format-styles-to-json styles)))
-         (extras (when styles
-                   `((textStyle . ,(vconcat styles))))))
-    (sgn-chat--send-and-persist chat-id plain extras styles-json nil nil nil)))
+(defun sgn-chat-start-reply (msg)
+  "Compose a reply to MSG in the current buffer."
+  (setq sgn-chat--reply-target msg
+        sgn-chat--edit-target nil)
+  (sgn-chat--redraw-prompt)
+  (goto-char (point-max)))
 
-(defun sgn-chat--do-send-reply (chat-id text quote-ts quote-author quote-body)
-  "Send TEXT as a reply in CHAT-ID."
-  (let* ((parsed (sgn-format-parse-markup text))
-         (plain (plist-get parsed :text))
-         (styles (plist-get parsed :styles))
-         (styles-json (when styles (sgn-format-styles-to-json styles)))
-         (extras `((quoteTimestamp . ,quote-ts)
-                   (quoteAuthor . ,quote-author)
-                   (quoteMessage . ,(or quote-body "")))))
-    (when styles
-      (push `(textStyle . ,(vconcat styles)) extras))
-    (sgn-chat--send-and-persist
-     chat-id plain extras styles-json quote-ts quote-author quote-body)))
-
-(defun sgn-chat--do-send-edit (chat-id text edit-ts)
-  "Send edited TEXT for message at EDIT-TS in CHAT-ID."
-  (let* ((parsed (sgn-format-parse-markup text))
-         (plain (plist-get parsed :text))
-         (styles (plist-get parsed :styles))
-         (extras (when styles
-                   `((textStyle . ,(vconcat styles))))))
-    (sgn-rpc-send-edit chat-id plain edit-ts extras)))
-
-(defun sgn-chat--send-and-persist (chat-id body extras styles-json
-                                           quote-ts quote-author quote-body)
-  "Send BODY to CHAT-ID with RPC EXTRAS, rendering it as sending.
-STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and QUOTE-BODY describe the
-message.  Once signal-cli replies, the message is marked as sent or
-failed, and the stored timestamp is replaced by the one Signal
-assigned, which other clients use to refer to the message in
-reactions, quotes, edits, and deletes.  Without a reply within
-`sgn-send-timeout' seconds, or if signal-cli stops before replying,
-the message is marked as unconfirmed."
-  (let ((rowid (sgn-chat--persist-and-render-sent
-                chat-id body styles-json quote-ts quote-author quote-body)))
-    (sgn-rpc-send-message
-     chat-id body extras
-     (lambda (result)
-       (sgn-chat--update-sent
-        chat-id rowid
-        (list :send-status (sgn-chat--send-result-status result)
-              :timestamp (alist-get 'timestamp result))))
-     (lambda (error-obj)
-       (sgn-chat--update-sent
-        chat-id rowid
-        (list :send-status (if (alist-get 'abandoned error-obj)
-                               "unconfirmed"
-                             "failed")))))
-    (run-at-time sgn-send-timeout nil
-                 #'sgn-chat--mark-unconfirmed chat-id rowid)))
-
-(defun sgn-chat--send-result-status (result)
-  "Return the send status for signal-cli send RESULT.
-RESULT lists the outcome for each recipient.  The status is
-\"sent\" when every recipient succeeded, \"failed\" when none did,
-and \"partial\" otherwise."
-  (let* ((types (mapcar (lambda (r) (alist-get 'type r))
-                        (alist-get 'results result)))
-         (successes (cl-count "SUCCESS" types :test #'equal)))
-    (cond
-     ((= successes (length types)) "sent")
-     ((zerop successes) "failed")
-     (t "partial"))))
-
-(defun sgn-chat--mark-unconfirmed (chat-id rowid)
-  "Mark sent message ROWID in CHAT-ID as unconfirmed if still sending."
-  (when (equal (plist-get (sgn-db-get-message-by-rowid rowid) :send-status)
-               "sending")
-    (sgn-chat--update-sent chat-id rowid '(:send-status "unconfirmed"))))
-
-(defun sgn-chat--update-sent (chat-id rowid attrs)
-  "Update sent message ROWID in CHAT-ID with ATTRS and re-render it."
-  (when rowid
-    (sgn-db-update-message rowid attrs)
-    (when-let* ((buf (get-buffer
-                      (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
-      (with-current-buffer buf
-        (sgn-chat-update-message rowid)))))
-
-(defun sgn-chat--persist-and-render-sent (chat-id body styles-json
-                                                   quote-ts quote-author
-                                                   quote-body)
-  "Persist and render a sent message as sending.
-CHAT-ID, BODY, STYLES-JSON, QUOTE-TS, QUOTE-AUTHOR, and
-QUOTE-BODY describe the message.  Return the new rowid."
-  (let* ((timestamp (truncate (* (float-time) 1000)))
-         (rowid (sgn-db-insert-message
-                 (list :chat-id chat-id
-                       :sender sgn-account
-                       :timestamp timestamp
-                       :body body
-                       :type "sync"
-                       :quote-ts quote-ts
-                       :quote-author quote-author
-                       :quote-body quote-body
-                       :styles-json styles-json
-                       :send-status "sending"))))
-    (sgn-db-upsert-chat chat-id :last-msg-ts timestamp)
-    (when rowid
-      (let ((msg (sgn-db-get-message-by-rowid rowid)))
-        (when msg
-          (sgn-chat-insert-message msg))))
-    (sgn-dashboard-refresh)
-    rowid))
-
-;;;; Cancel reply/edit
+(defun sgn-chat-start-edit (msg text)
+  "Edit MSG, starting from TEXT, in the current buffer.
+The input being composed is set aside until the edit is done."
+  (unless sgn-chat--edit-target
+    (setq sgn-chat--stashed-input (sgn-chat--input-text)))
+  (setq sgn-chat--edit-target msg
+        sgn-chat--reply-target nil)
+  (sgn-chat--redraw-prompt)
+  (sgn-chat--set-input text)
+  (goto-char (point-max)))
 
 (defun sgn-chat-cancel-action ()
-  "Cancel the current reply or edit action."
+  "Cancel the reply or edit being composed, or quit."
   (interactive)
   (cond
    (sgn-chat--reply-target
@@ -521,35 +678,63 @@ QUOTE-BODY describe the message.  Return the new rowid."
     (message "Reply cancelled."))
    (sgn-chat--edit-target
     (setq sgn-chat--edit-target nil)
-    (let ((inhibit-read-only t))
-      (delete-region (marker-position sgn-chat--input-marker) (point-max)))
+    (sgn-chat--set-input (sgn-chat--take-stash))
     (sgn-chat--redraw-prompt)
+    (goto-char (point-max))
     (message "Edit cancelled."))
-   (t
-    (keyboard-quit))))
+   (t (keyboard-quit))))
 
-;;;; Typing indicator
+(defun sgn-load-more-history ()
+  "Show `sgn-history-page-size' more of the chat's older messages."
+  (interactive)
+  (if (>= sgn-chat--limit (sgn-db-count-messages sgn-chat-id))
+      (message "All history loaded.")
+    (setq sgn-chat--limit (+ sgn-chat--limit sgn-history-page-size))
+    (sgn-chat--redraw)))
+
+(defun sgn-chat-show-message (rowid)
+  "Move point to message ROWID, loading older history if needed."
+  (when-let* ((msg (sgn-db-get-message-by-rowid rowid)))
+    (let ((newer (sgn-db-select-value
+                  "SELECT count(*) FROM messages WHERE chat_id = ?1
+                     AND (timestamp > ?2 OR (timestamp = ?2 AND rowid >= ?3))
+                     AND (expires_at IS NULL OR expires_at > ?4)"
+                  (list sgn-chat-id (plist-get msg :timestamp) rowid
+                        (sgn-db-now)))))
+      (when (> newer sgn-chat--limit)
+        (setq sgn-chat--limit (+ newer sgn-history-page-size))
+        (sgn-chat--redraw))
+      (when-let* ((match (save-excursion
+                           (goto-char (point-min))
+                           (text-property-search-forward 'sgn-message-rowid
+                                                         rowid t))))
+        (goto-char (prop-match-beginning match))
+        (recenter)))))
+
+;;;; Typing indicators sent
 
 (defun sgn-chat--on-input-change (beg _end _len)
-  "Handle changes in the input area starting at BEG.
-Sends typing indicators."
-  (when (and sgn-send-typing
-             sgn-chat-id
-             sgn-chat--input-marker
-             (marker-position sgn-chat--input-marker)
-             (>= beg (marker-position sgn-chat--input-marker))
-             (sgn-rpc-alive-p))
-    ;; Send typing start, at most once per refresh interval
-    (when (or (null sgn-chat--typing-sent-at)
-              (>= (float-time (time-since sgn-chat--typing-sent-at))
-                  sgn-chat--typing-refresh-interval))
-      (sgn-rpc-send-typing sgn-chat-id)
-      (setq sgn-chat--typing-sent-at (current-time)))
-    ;; Reset the stop timer
-    (when sgn-chat--typing-timer
-      (cancel-timer sgn-chat--typing-timer))
-    (setq sgn-chat--typing-timer
-          (run-at-time 5 nil #'sgn-chat--stop-typing-in (current-buffer)))))
+  "Send a typing indicator when the user changes the input at BEG."
+  (when (and (not sgn-chat--programmatic)
+             (>= beg sgn-chat--input-marker))
+    (sgn-chat--schedule-draft-save)
+    (when (and sgn-send-typing (sgn-rpc-alive-p)
+               (not (sgn-store-self-p sgn-chat-id)))
+      (if (string-blank-p (sgn-chat--input-text))
+          (sgn-chat--stop-typing)
+        (sgn-chat--start-typing)))))
+
+(defun sgn-chat--start-typing ()
+  "Tell the chat that we are typing, at most once per refresh interval."
+  (when (or (null sgn-chat--typing-sent-at)
+            (>= (float-time (time-since sgn-chat--typing-sent-at))
+                sgn-chat--typing-refresh-interval))
+    (sgn-rpc-send-typing (sgn-chat-address sgn-chat-id))
+    (setq sgn-chat--typing-sent-at (current-time)))
+  (when (timerp sgn-chat--typing-stop-timer)
+    (cancel-timer sgn-chat--typing-stop-timer))
+  (setq sgn-chat--typing-stop-timer
+        (run-at-time 5 nil #'sgn-chat--stop-typing-in (current-buffer))))
 
 (defun sgn-chat--stop-typing-in (buffer)
   "Send the typing stop indicator for the chat in BUFFER, if live."
@@ -558,368 +743,114 @@ Sends typing indicators."
       (sgn-chat--stop-typing))))
 
 (defun sgn-chat--stop-typing ()
-  "Send typing stop indicator, if a start indicator is outstanding."
-  (when (and sgn-chat--typing-sent-at sgn-chat-id (sgn-rpc-alive-p))
-    (sgn-rpc-send-typing sgn-chat-id t))
+  "Tell the chat that we stopped typing, if we said we were."
+  (when (and sgn-chat--typing-sent-at (sgn-rpc-alive-p))
+    (sgn-rpc-send-typing (sgn-chat-address sgn-chat-id) t))
   (setq sgn-chat--typing-sent-at nil)
-  (when sgn-chat--typing-timer
-    (cancel-timer sgn-chat--typing-timer)
-    (setq sgn-chat--typing-timer nil)))
+  (when (timerp sgn-chat--typing-stop-timer)
+    (cancel-timer sgn-chat--typing-stop-timer))
+  (setq sgn-chat--typing-stop-timer nil))
 
-;;;; Typing indicator display
+;;;; Typing indicators received
 
-(defun sgn-chat-show-typing (chat-id sender)
-  "Show that SENDER is typing in CHAT-ID."
-  (let* ((buf (get-buffer (format "*sgn: %s*" (sgn-contacts-get-name chat-id)))))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((name (sgn-contacts-display-sender sender)))
-          (setq sgn-chat--typing-indicator
-                (format "%s is typing…" name))
-          (setq header-line-format
-                (list (sgn-chat--header-line-base)
-                      " — " sgn-chat--typing-indicator))
-          (force-mode-line-update))
-        ;; Auto-clear after 10 seconds
-        (run-at-time 10 nil
-                     (lambda (b)
-                       (when (buffer-live-p b)
-                         (with-current-buffer b
-                           (sgn-chat-clear-typing))))
-                     buf)))))
+(defun sgn-chat-on-typing (chat-id sender started)
+  "Show or hide that SENDER is typing in CHAT-ID, as STARTED says."
+  (when-let* ((buf (sgn-chat-buffer chat-id))
+              ((bound-and-true-p sgn-db--connection)))
+    (with-current-buffer buf
+      (when-let* ((entry (assoc sender sgn-chat--typists)))
+        (cancel-timer (cdr entry))
+        (setq sgn-chat--typists (delq entry sgn-chat--typists)))
+      (when started
+        (push (cons sender (run-at-time sgn-chat--typing-display-timeout nil
+                                        #'sgn-chat-on-typing chat-id sender nil))
+              sgn-chat--typists))
+      (setq header-line-format (sgn-chat--header-line))
+      (force-mode-line-update))))
 
-(defun sgn-chat-clear-typing ()
-  "Clear the typing indicator."
-  (setq sgn-chat--typing-indicator nil)
-  (setq header-line-format (sgn-chat--header-line-base))
-  (force-mode-line-update))
+;;;; Drafts
 
-(defun sgn-chat--header-line-base ()
-  "Return the base header line string for the current chat."
-  (let* ((name (sgn-contacts-get-name sgn-chat-id))
-         (chat (sgn-db-get-chat sgn-chat-id))
-         (expiration (and chat (plist-get chat :expiration))))
-    (concat name
-            (when (and expiration (> expiration 0))
-              (format " ⏱ %s" (sgn-chat--format-duration expiration))))))
+(defun sgn-chat--schedule-draft-save ()
+  "Save the input as a draft once typing pauses."
+  (when (timerp sgn-chat--draft-timer)
+    (cancel-timer sgn-chat--draft-timer))
+  (setq sgn-chat--draft-timer
+        (run-with-idle-timer 2 nil #'sgn-chat--save-draft-in (current-buffer))))
 
-;;;; Draft persistence
+(defun sgn-chat--save-draft-in (buffer)
+  "Save the input of BUFFER as its chat's draft, if BUFFER is live."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (sgn-chat--save-draft))))
 
 (defun sgn-chat--save-draft ()
-  "Save the current input as a draft."
-  (when sgn-chat-id
-    (let ((text (sgn-chat--get-input-text)))
-      (sgn-db-save-draft sgn-chat-id
-                         (if (string-empty-p (string-trim text)) nil text)))))
+  "Save the input as the chat's draft.
+Text being edited into an existing message is not a draft."
+  (when (and sgn-chat-id (bound-and-true-p sgn-db--connection))
+    (sgn-db-save-draft sgn-chat-id (if sgn-chat--edit-target
+                                       sgn-chat--stashed-input
+                                     (sgn-chat--input-text)))))
+
+(defun sgn-chat-save-all-drafts ()
+  "Save the drafts of all chat buffers."
+  (dolist (buf (sgn-chat-buffers))
+    (with-current-buffer buf
+      (sgn-chat--save-draft))))
 
 (defun sgn-chat--restore-draft ()
-  "Restore a saved draft into the input area."
-  (when sgn-chat-id
-    (let ((draft (sgn-db-get-draft sgn-chat-id)))
-      (when (and draft (not (string-empty-p draft)))
-        (goto-char (point-max))
-        (insert draft)))))
+  "Put the chat's saved draft in the input area."
+  (when-let* ((draft (sgn-db-get-draft sgn-chat-id)))
+    (sgn-chat--set-input draft)))
 
 (defun sgn-chat--on-kill ()
-  "Handle buffer kill: save draft, stop timers."
-  (sgn-chat--save-draft)
-  (sgn-chat--stop-typing))
+  "Save the draft and stop timers when the buffer is killed."
+  (ignore-errors (sgn-chat--save-draft))
+  (ignore-errors (sgn-chat--stop-typing))
+  (dolist (timer (list sgn-chat--redraw-timer sgn-chat--draft-timer
+                       sgn-chat--typing-stop-timer))
+    (when (timerp timer) (cancel-timer timer)))
+  (dolist (entry sgn-chat--typists)
+    (cancel-timer (cdr entry)))
+  (sgn-chat--unregister))
 
-;;;; History loading
+;;;; Reading
 
-(defun sgn-chat--load-history ()
-  "Load the most recent messages from the database."
-  (let ((messages (sgn-db-get-messages sgn-chat-id sgn-history-page-size)))
-    (when messages
-      (setq sgn-chat--oldest-timestamp
-            (plist-get (car messages) :timestamp))
-      (when (< (length messages) sgn-history-page-size)
-        (setq sgn-chat--all-loaded t))
-      (let ((inhibit-read-only t))
-        (save-excursion
-          (goto-char (point-min))
-          (dolist (msg messages)
-            (sgn-chat--render-message msg)))))))
+(defun sgn-chat-visible-p (chat-id)
+  "Return non-nil if CHAT-ID is in the selected window of a focused frame."
+  (let ((buf (sgn-chat-buffer chat-id)))
+    (and buf
+         (eq buf (window-buffer (selected-window)))
+         (frame-focus-state))))
 
-(defun sgn-load-more-history ()
-  "Load older messages from the database."
-  (interactive)
-  (if sgn-chat--all-loaded
-      (message "All history loaded.")
-    (message "Load more history: not yet implemented (Phase 2)")))
-
-;;;; Message rendering
-
-(defun sgn-chat-insert-message (msg)
-  "Insert a new incoming/sync message MSG into the chat buffer.
-MSG is a message plist from the database."
-  (let ((chat-id (plist-get msg :chat-id)))
-    (when-let* ((buf (get-buffer
-                      (format "*sgn: %s*"
-                              (sgn-contacts-get-name chat-id)))))
-      (when (buffer-live-p buf)
-        (with-current-buffer buf
-          (let ((inhibit-read-only t))
-            (save-excursion
-              ;; Insert before the prompt
-              (goto-char (marker-position sgn-chat--prompt-start))
-              (sgn-chat--render-message msg)))
-          ;; Scroll to bottom if window is visible
-          (let ((win (get-buffer-window buf)))
-            (when win
-              (set-window-point win (point-max)))))))))
-
-(defun sgn-chat-update-message (rowid)
-  "Re-render the message with ROWID in the appropriate buffer.
-Used after edits, deletes, or reaction changes."
-  ;; Find and re-render the message region
-  (save-excursion
-    (goto-char (point-min))
-    (let ((pos (text-property-search-forward 'sgn-message-rowid rowid t)))
-      (when pos
-        (let* ((start (prop-match-beginning pos))
-               (end (or (next-single-property-change start 'sgn-message-rowid)
-                        (marker-position sgn-chat--prompt-start)))
-               (msg (sgn-db-get-message-by-rowid rowid))
-               (inhibit-read-only t))
-          (when msg
-            ;; Check if this message had a header (not grouped)
-            (let ((has-header (get-text-property start 'sgn-message-header)))
-              (delete-region start end)
-              (goto-char start)
-              ;; Re-render with forced header if it had one
-              (if has-header
-                  (let ((sgn-chat--last-sender nil)
-                        (sgn-chat--last-timestamp nil))
-                    (sgn-chat--render-message msg))
-                (sgn-chat--render-message-body msg)))))))))
-
-(declare-function sgn-db-get-message-by-rowid "sgn-db")
-
-(defun sgn-chat--render-message (msg)
-  "Render a single message MSG at point.
-Handles grouping, headers, body, quotes, reactions, and media."
-  (let* ((sender (plist-get msg :sender))
-         (timestamp (plist-get msg :timestamp))
-         (need-header (sgn-chat--needs-header-p sender timestamp))
-         (start (point)))
-    ;; Header (if not grouped)
-    (when need-header
-      (sgn-chat--render-header sender timestamp)
-      (put-text-property start (point) 'sgn-message-header t)
-      (put-text-property start (point) 'keymap sgn-chat-message-map)
-      (put-text-property start (point) 'rear-nonsticky '(keymap)))
-    ;; Body
-    (sgn-chat--render-message-body msg)
-    ;; Update grouping state
-    (setq sgn-chat--last-sender sender)
-    (setq sgn-chat--last-timestamp timestamp)))
-
-(defun sgn-chat--needs-header-p (sender timestamp)
-  "Return non-nil if a new header is needed for SENDER at TIMESTAMP."
-  (or (null sgn-chat--last-sender)
-      (not (equal sender sgn-chat--last-sender))
-      (and sgn-chat--last-timestamp timestamp
-           (> (abs (- timestamp sgn-chat--last-timestamp))
-              (* sgn-message-grouping-interval 1000)))))
-
-(defun sgn-chat--render-header (sender timestamp)
-  "Render a message group header for SENDER at TIMESTAMP."
-  (let* ((name (sgn-contacts-display-sender sender))
-         (time-str (sgn-chat--format-timestamp timestamp))
-         (header (format "── %s · %s " name time-str))
-         (fill (make-string (max 0 (- (window-width) (length header) 1)) ?─)))
-    (insert (propertize (concat header fill "\n")
-                        'face 'sgn-header-face
-                        'sgn-header-sender sender))))
-
-(defun sgn-chat--render-message-body (msg)
-  "Render the body, quote, reactions, and media of MSG at point."
-  (let* ((rowid (plist-get msg :rowid))
-         (sender (plist-get msg :sender))
-         (timestamp (plist-get msg :timestamp))
-         (chat-id (plist-get msg :chat-id))
-         (body (plist-get msg :body))
-         (deleted (plist-get msg :deleted))
-         (edited-at (plist-get msg :edited-at))
-         (quote-ts (plist-get msg :quote-ts))
-         (quote-author (plist-get msg :quote-author))
-         (quote-body (plist-get msg :quote-body))
-         (styles-json (plist-get msg :styles-json))
-         (send-status (plist-get msg :send-status))
-         (target-author sender)
-         (start (point)))
-    ;; Quote block
-    (when (and quote-ts quote-author)
-      (sgn-chat--render-quote quote-author quote-body))
-    ;; Message body
-    (cond
-     ((and deleted (not (zerop deleted)))
-      (insert (propertize "  [Message deleted]\n" 'face 'sgn-deleted-face)))
-     (body
-      (let ((styled-text (if styles-json
-                             (sgn-format-apply-styles body styles-json)
-                           body)))
-        (insert "  " styled-text)
-        (when (and edited-at (not (zerop edited-at)))
-          (insert (propertize " (edited)" 'face 'sgn-timestamp-face)))
-        (sgn-chat--insert-send-status send-status)
-        (insert "\n")))
-     (t
-      ;; Media-only message, no text body
-      nil))
-    ;; Media
-    (when rowid
-      (let ((media-list (sgn-db-get-media rowid)))
-        (when media-list
-          (dolist (m media-list)
-            (insert "  ")
-            (let ((content-type (plist-get m :content-type))
-                  (file-path (plist-get m :file-path))
-                  (is-voice (plist-get m :is-voice)))
-              (cond
-               ((and is-voice (not (zerop is-voice)) file-path)
-                (sgn-media-insert-voice-note file-path 0))
-               ((and file-path content-type
-                     (string-prefix-p "image/" content-type))
-                (sgn-media-insert-inline-image file-path))
-               (file-path
-                (insert (propertize
-                         (format "[File: %s]"
-                                 (or (plist-get m :file-name) "attachment"))
-                         'face 'link)))
-               (t
-                (insert (propertize "[Media not downloaded]"
-                                    'face 'font-lock-comment-face)))))
-            (insert "\n")))))
-    ;; Reactions
-    (when rowid
-      (let ((reactions (sgn-db-get-reactions rowid)))
-        (when reactions
-          (sgn-chat--render-reactions reactions))))
-    ;; Pin indicator
-    (when rowid
-      (let ((pins (sgn-db-get-pins chat-id)))
-        (when (cl-find-if (lambda (p)
-                            (equal (plist-get p :message-rowid) rowid))
-                          pins)
-          (insert "  📌\n"))))
-    ;; Apply text properties to the entire message region
-    (put-text-property start (point) 'sgn-message-rowid rowid)
-    (put-text-property start (point) 'sgn-message-ts timestamp)
-    (put-text-property start (point) 'sgn-message-sender sender)
-    (put-text-property start (point) 'sgn-message-chat-id chat-id)
-    (put-text-property start (point) 'sgn-message-target-author target-author)
-    ;; Protect message area from editing (cursor still moves freely)
-    (put-text-property start (point) 'read-only t)
-    (put-text-property start (point) 'keymap sgn-chat-message-map)
-    (put-text-property start (point) 'rear-nonsticky '(read-only keymap))))
-
-(defun sgn-chat--insert-send-status (status)
-  "Insert the label for send STATUS, if it has one.
-See `sgn-chat--send-status-labels'."
-  (when-let* ((entry (assoc status sgn-chat--send-status-labels)))
-    (insert (propertize (format " (%s)" (nth 1 entry))
-                        'face (nth 2 entry)))))
-
-(defun sgn-chat--render-quote (author body)
-  "Render a quote block for AUTHOR with BODY."
-  (let* ((name (sgn-contacts-display-sender author))
-         (preview (if (and body (> (length body) 60))
-                      (concat (substring body 0 60) "…")
-                    (or body ""))))
-    (insert (propertize (format "  ┃ %s: %s\n" name preview)
-                        'face 'sgn-quote-face))))
-
-(defun sgn-chat--render-reactions (reactions)
-  "Render REACTIONS below the message body."
-  ;; Group by emoji
-  (let ((groups (make-hash-table :test 'equal)))
-    (dolist (r reactions)
-      (let ((emoji (plist-get r :emoji))
-            (sender (plist-get r :sender)))
-        (push (sgn-contacts-display-sender sender)
-              (gethash emoji groups))))
-    (insert "  ")
-    (maphash (lambda (emoji senders)
-               (insert (format "%s %s  "
-                               emoji
-                               (string-join (nreverse senders) ", "))))
-             groups)
-    (insert "\n")))
-
-;;;; Timestamp formatting
-
-(defun sgn-chat--format-timestamp (timestamp-ms)
-  "Format TIMESTAMP-MS according to `sgn-timestamp-format'."
-  (let* ((time (seconds-to-time (/ timestamp-ms 1000.0)))
-         (now (current-time))
-         (diff (float-time (time-subtract now time))))
-    (pcase sgn-timestamp-format
-      ('relative (sgn-chat--format-relative diff))
-      ('absolute (format-time-string "%b %d, %H:%M" time))
-      ('smart
-       (cond
-        ((< diff 86400)  ; today
-         (format-time-string "%H:%M" time))
-        ((< diff 604800) ; this week
-         (format-time-string "%a, %H:%M" time))
-        (t
-         (format-time-string "%b %d, %H:%M" time)))))))
-
-(defun sgn-chat--format-relative (diff-seconds)
-  "Format DIFF-SECONDS as a relative time string."
-  (cond
-   ((< diff-seconds 60) "now")
-   ((< diff-seconds 3600) (format "%dm" (floor (/ diff-seconds 60))))
-   ((< diff-seconds 86400) (format "%dh" (floor (/ diff-seconds 3600))))
-   (t (format "%dd" (floor (/ diff-seconds 86400))))))
-
-(defun sgn-chat--format-duration (seconds)
-  "Format SECONDS as a human-readable duration (e.g., \"24h\", \"7d\")."
-  (cond
-   ((< seconds 60) (format "%ds" seconds))
-   ((< seconds 3600) (format "%dm" (/ seconds 60)))
-   ((< seconds 86400) (format "%dh" (/ seconds 3600)))
-   (t (format "%dd" (/ seconds 86400)))))
-
-;;;; System messages
-
-(defun sgn-chat-insert-system-msg (chat-id text &optional face)
-  "Insert a system message TEXT into the chat buffer for CHAT-ID.
-FACE defaults to `sgn-error-face'."
-  (when-let* ((buf (get-buffer
-                    (format "*sgn: %s*"
-                            (sgn-contacts-get-name chat-id)))))
-    (when (buffer-live-p buf)
-      (with-current-buffer buf
-        (let ((inhibit-read-only t))
-          (save-excursion
-            (goto-char (marker-position sgn-chat--prompt-start))
-            (insert (propertize (concat "*** " text "\n")
-                                'face (or face 'sgn-error-face)))))))))
+(defun sgn-chat--mark-selected-read (&rest _)
+  "Mark read the chat in the selected window, if its frame has focus."
+  (let ((buf (window-buffer (selected-window))))
+    (when (and (eq (buffer-local-value 'major-mode buf) 'sgn-chat-mode)
+               (frame-focus-state)
+               (bound-and-true-p sgn-db--connection))
+      (sgn-mark-chat-read (buffer-local-value 'sgn-chat-id buf)))))
 
 ;;;; Message at point
 
 (defun sgn-chat-message-at-point ()
-  "Return a plist of the message at point, or nil."
-  (let ((rowid (get-text-property (point) 'sgn-message-rowid)))
-    (when rowid
-      (list :rowid rowid
-            :timestamp (get-text-property (point) 'sgn-message-ts)
-            :sender (get-text-property (point) 'sgn-message-sender)
-            :chat-id (get-text-property (point) 'sgn-message-chat-id)
-            :target-author (get-text-property (point) 'sgn-message-target-author)))))
-
-;;;; Open media/link at point
+  "Return the message at point as a plist, or nil."
+  (when-let* ((rowid (get-text-property (point) 'sgn-message-rowid)))
+    (sgn-db-get-message-by-rowid rowid)))
 
 (defun sgn-open-at-point ()
-  "Open media or link at point."
+  "Open what is at point: reveal a spoiler, play a voice note, open media or a URL."
   (interactive)
-  (let ((button (button-at (point))))
-    (if button
-        (push-button (point))
-      (message "Nothing to open at point."))))
+  (cond
+   ((get-text-property (point) 'sgn-spoiler)
+    (push (get-text-property (point) 'sgn-message-rowid) sgn-chat--revealed)
+    (sgn-chat--redraw))
+   ((get-text-property (point) 'sgn-voice-note)
+    (sgn-media-play-audio (get-text-property (point) 'sgn-voice-note)))
+   ((get-text-property (point) 'sgn-media-path)
+    (sgn-media-open (get-text-property (point) 'sgn-media-path)))
+   ((thing-at-point 'url)
+    (browse-url (thing-at-point 'url)))
+   (t (message "Nothing to open here"))))
 
 (provide 'sgn-chat)
 ;;; sgn-chat.el ends here

@@ -157,7 +157,9 @@
   (and (stringp s) (not (string-empty-p s)) s))
 
 (defun sgn-contacts--record-groups (groups)
-  "Record the groups in GROUPS, a listGroups result."
+  "Record the groups in GROUPS, a listGroups result.
+Members' numbers are merged into their ACIs, which covers people
+who are not in the contact list."
   (let ((changed nil))
     (sgn-db-with-transaction
       (dolist (group groups)
@@ -169,11 +171,16 @@
               (push id changed))
             (sgn-contacts-set-name id name)
             (dolist (member (alist-get 'members group))
-              (when-let* ((uuid (alist-get 'uuid member)))
-                (when (equal (alist-get 'number member) sgn-account)
-                  (sgn-store-learn-self uuid))))))))
+              (let ((uuid (sgn-contacts--non-empty (alist-get 'uuid member)))
+                    (number (sgn-contacts--non-empty (alist-get 'number member))))
+                (when (and uuid number)
+                  (if (equal number sgn-account)
+                      (sgn-store-learn-self uuid)
+                    (puthash uuid number sgn-contacts--numbers)
+                    (when (sgn-db-merge-identity number uuid)
+                      (push uuid changed))))))))))
     (when changed
-      (apply #'sgn-store-changed changed))))
+      (apply #'sgn-store-changed (delete-dups changed)))))
 
 ;;;; Completing-read
 

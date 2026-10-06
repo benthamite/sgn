@@ -1229,6 +1229,22 @@ and a delete that arrives first applies when the message does."
     (should (string-match-p "could not be read: Untrusted identity"
                             (car (sgn-test-body sgn-test-alice-uuid))))))
 
+(ert-deftest sgn-test-group-members-are-merged ()
+  "A group member's number is merged into their ACI from the group list."
+  (sgn-test-with-session
+    (sgn-db-ensure-chat sgn-test-group "group")
+    (sgn-db-insert-message (list :chat-id sgn-test-group :sender sgn-test-bob-number
+                                 :timestamp 1 :body "hi"))
+    (sgn-contacts--record-groups
+     `(((id . ,sgn-test-group) (name . "G")
+        (members . (((number . ,sgn-test-bob-number) (uuid . ,sgn-test-bob-uuid)
+                     (isAdmin . nil))
+                    ((number . ,sgn-test-self-number) (uuid . ,sgn-test-self-uuid)
+                     (isAdmin . nil)))))))
+    (should (equal (plist-get (car (sgn-test-chat-messages sgn-test-group)) :sender)
+                   sgn-test-bob-uuid))
+    (should (equal sgn-store--self-uuid sgn-test-self-uuid))))
+
 ;;;; Dashboard, notifications, search
 
 (ert-deftest sgn-test-dashboard-lists-chats ()

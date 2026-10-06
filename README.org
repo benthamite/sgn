@@ -423,7 +423,7 @@ The command ~sgn-set-disappearing~ sets the disappearing message timer for the c
 
 The command ~sgn-block-contact~ blocks a contact or group after confirmation.  The command ~sgn-unblock-contact~ unblocks a previously blocked one.  Both prompt via ~completing-read~ and report whether =signal-cli= succeeded.
 
-The command ~sgn-contacts-refresh~ fetches the latest contacts and groups from =signal-cli= and updates both the in-memory cache and the database.  A contact's display name is their nickname, the name you gave them, their profile name, or their username, in that order of preference.  When a contact entry pairs a phone number with an ACI, data stored under the number is merged into the ACI.  This runs automatically on startup and every five minutes, but you can invoke it manually if a contact name has not yet updated.
+The command ~sgn-contacts-refresh~ fetches the latest contacts and groups from =signal-cli= and updates both the in-memory cache and the database.  A contact's display name is their nickname, the name you gave them, their profile name, or their username, in that order of preference.  When a contact entry or a group's member list pairs a phone number with an ACI, data stored under the number is merged into the ACI.  This runs automatically on startup and every five minutes, but you can invoke it manually if a contact name has not yet updated.
 
 ** Global indicator
 :PROPERTIES:

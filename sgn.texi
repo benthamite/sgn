@@ -525,7 +525,7 @@ The command @code{sgn-set-disappearing} sets the disappearing message timer for 
 
 The command @code{sgn-block-contact} blocks a contact or group after confirmation.  The command @code{sgn-unblock-contact} unblocks a previously blocked one.  Both prompt via @code{completing-read} and report whether @samp{signal-cli} succeeded. @*
 
-The command @code{sgn-contacts-refresh} fetches the latest contacts and groups from @samp{signal-cli} and updates both the in-memory cache and the database.  A contact's display name is their nickname@comma{} the name you gave them@comma{} their profile name@comma{} or their username@comma{} in that order of preference.  When a contact entry pairs a phone number with an ACI@comma{} data stored under the number is merged into the ACI@.  This runs automatically on startup and every five minutes@comma{} but you can invoke it manually if a contact name has not yet updated. @*
+The command @code{sgn-contacts-refresh} fetches the latest contacts and groups from @samp{signal-cli} and updates both the in-memory cache and the database.  A contact's display name is their nickname@comma{} the name you gave them@comma{} their profile name@comma{} or their username@comma{} in that order of preference.  When a contact entry or a group's member list pairs a phone number with an ACI@comma{} data stored under the number is merged into the ACI@.  This runs automatically on startup and every five minutes@comma{} but you can invoke it manually if a contact name has not yet updated. @*
 
 @node Global indicator
 @section Global indicator

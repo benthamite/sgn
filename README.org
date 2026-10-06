@@ -423,7 +423,7 @@ The function ~sgn-db-purge-expired~ deletes messages whose expiration timestamp 
 #+findex: sgn-rpc-alive-p
 #+findex: sgn-rpc-send
 #+findex: sgn-rpc-send-message
-The function ~sgn-rpc-start~ starts the =signal-cli= JSON-RPC subprocess.  It resets all internal state and launches the process with a filter and sentinel for handling incoming data.
+The function ~sgn-rpc-start~ starts the =signal-cli= JSON-RPC subprocess.  It resets all internal state and launches the process over a pipe, with a filter and sentinel for handling incoming data.  A pipe rather than a pty is required: on macOS a pty drops input beyond 1024 bytes per line, which would silently lose long requests such as replies quoting long messages.
 
 The function ~sgn-rpc-stop~ stops the subprocess.
 

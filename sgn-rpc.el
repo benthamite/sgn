@@ -156,10 +156,14 @@ mode, signal-cli receives messages automatically."
   (clrhash sgn-rpc--request-methods)
   (clrhash sgn-rpc--request-params)
   (clrhash sgn-rpc--retried-ids)
-  ;; Start the process.
+  ;; Start the process.  It must use a pipe: a pty's line discipline
+  ;; drops input beyond 1024 bytes per line on macOS, so a long
+  ;; request (such as a reply quoting a long message) would never
+  ;; reach signal-cli, and every later request would pile onto it.
   (let ((proc (make-process
                :name sgn-rpc--process-name
                :buffer sgn-rpc--buffer-stderr
+               :connection-type 'pipe
                :command (list sgn-cli-program
                              "-a" sgn-account
                              "jsonRpc")

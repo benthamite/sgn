@@ -230,6 +230,33 @@
         (should (equal (car sent) sgn-rpc--process-name))
         (should (string-match-p "\"method\":\"send\"" (cadr sent)))))))
 
+(ert-deftest sgn-test-rpc-delivers-long-requests ()
+  "A request longer than a pty's line limit reaches signal-cli intact."
+  (sgn-test-with-clean-state
+    (let* ((script (make-temp-file "sgn-test-cli-" nil ".sh"
+                                   (concat "#!/bin/sh\n"
+                                           "IFS= read -r line\n"
+                                           "printf '{\"jsonrpc\":\"2.0\",\"id\":1,"
+                                           "\"result\":{\"length\":%d}}\\n' "
+                                           "\"${#line}\"\n")))
+           (sgn-cli-program script)
+           (sgn-account "+15550000000")
+           (result nil))
+      (unwind-protect
+          (cl-letf (((symbol-function 'sgn--log) #'ignore)
+                    ((symbol-function 'message) #'ignore))
+            (set-file-modes script #o700)
+            (sgn-rpc-start)
+            (sgn-rpc-send "send" `((message . ,(make-string 4000 ?a)))
+                          (lambda (r) (setq result r)))
+            (with-timeout (5)
+              (while (not result)
+                (accept-process-output (get-process sgn-rpc--process-name)
+                                       0.1)))
+            (should (> (alist-get 'length result) 4000)))
+        (sgn-rpc-stop)
+        (delete-file script)))))
+
 (ert-deftest sgn-test-abnormal-exit-reports-output-and-stops-restarts ()
   "An abnormal exit is reported with signal-cli's text and not restarted."
   (sgn-test-with-clean-state
